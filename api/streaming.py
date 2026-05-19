@@ -3525,6 +3525,13 @@ def _run_agent_streaming(
 
                 args_snap = _tool_args_snapshot(args)
 
+                # Modern Hermes Agent builds can call both tool_progress_callback
+                # and the structured tool_start/tool_complete callbacks for the
+                # same tool. Prefer the structured path when it is supported so
+                # the browser receives one tid-tagged tool card per real call.
+                if event_type in (None, 'tool.started') and 'tool_start_callback' in _agent_params:
+                    return
+
                 if event_type in (None, 'tool.started'):
                     _live_tool_calls.append({
                         'name': name,
@@ -3558,6 +3565,9 @@ def _run_agent_streaming(
                                 put('approval', p)
                     except ImportError:
                         pass
+                    return
+
+                if event_type == 'tool.completed' and 'tool_complete_callback' in _agent_params:
                     return
 
                 if event_type == 'tool.completed':

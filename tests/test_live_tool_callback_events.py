@@ -52,6 +52,16 @@ def test_tool_complete_callback_emits_existing_tool_complete_sse_event_with_tool
     assert "_checkpoint_activity[0] += 1" in block
 
 
+def test_legacy_progress_events_are_suppressed_when_structured_callbacks_are_wired():
+    src = _read("api/streaming.py")
+    block = _function_block(src, "on_tool")
+
+    assert "event_type in (None, 'tool.started') and 'tool_start_callback' in _agent_params" in block
+    assert "event_type == 'tool.completed' and 'tool_complete_callback' in _agent_params" in block
+    assert block.index("'tool_start_callback' in _agent_params") < block.index("put('tool'")
+    assert block.index("'tool_complete_callback' in _agent_params") < block.index("put('tool_complete'")
+
+
 def test_tool_callback_events_keep_existing_frontend_event_contract():
     messages = _read("static/messages.js")
     ui = _read("static/ui.js")
