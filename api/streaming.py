@@ -1369,11 +1369,15 @@ def generate_title_raw_via_aux(
         return None, 'missing_exchange'
     qa, prompts = _title_prompts(user_text, assistant_text)
     configured = _get_aux_title_config()
+    caller_supplied_route = bool(provider or model or base_url)
     provider = provider or configured.get('provider', '') or ''
     if str(provider).strip().lower() == 'auto':
         provider = ''
     model = model or configured.get('model', '') or ''
     base_url = base_url or configured.get('base_url', '') or ''
+    api_key = ''
+    if not caller_supplied_route:
+        api_key = str(configured.get('api_key', '') or '').strip()
     base_max_tokens = _title_completion_budget(provider, model, base_url)
     reasoning_extra = {"reasoning": {"enabled": False}}
     if _is_minimax_route(provider, model, base_url):
@@ -1395,6 +1399,7 @@ def generate_title_raw_via_aux(
                         provider=provider or None,
                         model=model or None,
                         base_url=base_url or None,
+                        api_key=api_key or None,
                         messages=messages,
                         max_tokens=max_tokens,
                         temperature=0.2,
