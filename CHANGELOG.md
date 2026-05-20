@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- **PR #2634** by @Michaelyklam (closes #2632) — Show `custom_providers` entries created by `hermes model` in Settings → Providers as read-only config-managed provider cards, including their configured models and key status, instead of filtering them out because they are not WebUI-editable API-key providers.
+
 
 ## [v0.51.95] — 2026-05-20 — Release BS (stage-388 — 5-PR batch — live tool callback event dedup + browser-only dashboard links + messaging transcript merge alignment + Geist Contrast skin + SSE runtime diagnostics)
 
