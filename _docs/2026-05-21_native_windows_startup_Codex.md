@@ -90,3 +90,47 @@ STOPPED=1
   available.
 - WSL2 was recovered separately and is available, but this change keeps native
   Windows startup as the primary path.
+
+## Git Closeout
+
+The implementation was rebased by fast-forwarding local `master` to
+`origin/master` first, then reapplying this work and retesting.
+
+```text
+git fetch origin
+git rev-list --left-right --count origin/master...HEAD
+-> 91 0
+
+git stash push -u -m codex-native-windows-startup-before-ff
+git merge --ff-only origin/master
+git stash pop
+
+python -m pytest tests/test_onboarding_static.py tests/test_windows_native_start.py tests/test_bootstrap_python_selection.py -q -o addopts='' -p no:cacheprovider --basetemp=H:\codex-tmp\hermes-webui-after-ff-pytest\basetemp
+-> 10 passed in 6.80s
+
+git commit -m "feat: support native Windows startup"
+-> 99537c56
+```
+
+`origin` points at `nesquena/hermes-webui`, and the authenticated GitHub user did
+not have push permission there:
+
+```text
+git push origin master
+-> Permission to nesquena/hermes-webui.git denied to zapabob.
+```
+
+A user fork was created and used as the push target:
+
+```text
+gh repo fork nesquena/hermes-webui --default-branch-only
+-> https://github.com/zapabob/hermes-webui
+
+git remote add zapabob https://github.com/zapabob/hermes-webui.git
+git push zapabob master
+-> 7057c942..99537c56 master -> master
+
+git branch --set-upstream-to=zapabob/master master
+git status --short --branch
+-> ## master...zapabob/master
+```
