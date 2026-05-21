@@ -47,6 +47,9 @@ def test_ensure_python_fails_loudly_when_no_interpreter_can_import_agent(monkeyp
     venv_subdir = tmp_path / ".venv" / "bin"
     venv_subdir.mkdir(parents=True, exist_ok=True)
     (venv_subdir / "python").write_text("", encoding="utf-8")
+    venv_win_subdir = tmp_path / ".venv" / "Scripts"
+    venv_win_subdir.mkdir(parents=True, exist_ok=True)
+    (venv_win_subdir / "python.exe").write_text("", encoding="utf-8")
     if (tmp_path / ".venv").exists():  # platform-independent guard
         pass
 

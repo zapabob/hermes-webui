@@ -175,15 +175,24 @@ def _discover_python(agent_dir: Path) -> str:
     if local_venv.exists():
         return str(local_venv)
 
-    # Fall back to system python3
+    local_venv_win = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
+    if local_venv_win.exists():
+        return str(local_venv_win)
+
+    # Fall back to the current interpreter before shell aliases. On native
+    # Windows, the python3 App Execution Alias can resolve to a non-runtime
+    # Microsoft Store shim that cannot run server subprocesses.
     import shutil
 
-    for name in ("python3", "python"):
+    if sys.executable and Path(sys.executable).exists():
+        return sys.executable
+
+    for name in ("python", "python3"):
         found = shutil.which(name)
-        if found:
+        if found and "WindowsApps" not in found:
             return found
 
-    return "python3"
+    return sys.executable or "python3"
 
 
 # Run discovery

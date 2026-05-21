@@ -18,6 +18,7 @@ import os
 import pathlib
 import shutil
 import subprocess
+import sys
 import time
 import urllib.request
 import urllib.error
@@ -110,7 +111,16 @@ def _discover_python(agent_dir) -> str:
     local_venv = REPO_ROOT / '.venv' / 'bin' / 'python'
     if local_venv.exists():
         return str(local_venv)
-    return shutil.which('python3') or shutil.which('python') or 'python3'
+    local_venv_win = REPO_ROOT / '.venv' / 'Scripts' / 'python.exe'
+    if local_venv_win.exists():
+        return str(local_venv_win)
+    if sys.executable and pathlib.Path(sys.executable).exists():
+        return sys.executable
+    for name in ('python', 'python3'):
+        found = shutil.which(name)
+        if found and 'WindowsApps' not in found:
+            return found
+    return sys.executable or 'python3'
 
 HERMES_AGENT = _discover_agent_dir()
 VENV_PYTHON  = _discover_python(HERMES_AGENT)
@@ -471,7 +481,13 @@ def test_server():
     real_skills  = HERMES_HOME / 'skills'
     test_skills  = TEST_STATE_DIR / 'skills'
     if real_skills.exists() and not test_skills.exists():
-        test_skills.symlink_to(real_skills)
+        try:
+            test_skills.symlink_to(real_skills, target_is_directory=True)
+        except OSError:
+            # Native Windows often lacks symlink privilege outside Developer
+            # Mode. Copying keeps test writes isolated while preserving the
+            # expected skill files for skill-related tests.
+            shutil.copytree(real_skills, test_skills)
 
     # Isolated cron state
     (TEST_STATE_DIR / 'cron').mkdir(parents=True, exist_ok=True)

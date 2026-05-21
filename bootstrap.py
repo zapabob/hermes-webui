@@ -83,11 +83,10 @@ def is_wsl() -> bool:
 
 
 def ensure_supported_platform() -> None:
-    if platform.system() == "Windows" and not is_wsl():
-        raise RuntimeError(
-            "Native Windows is not supported for this bootstrap yet. "
-            "Please run it from Linux, macOS, or inside WSL2."
-        )
+    # Native Windows is supported when Hermes Agent is already present or
+    # HERMES_WEBUI_AGENT_DIR points at a checkout. The only remaining
+    # platform-specific gap is the optional shell installer below.
+    return None
 
 
 def _agent_dir_from_hermes_cli() -> Path | None:
@@ -162,7 +161,13 @@ def discover_launcher_python(agent_dir: Path | None) -> str:
         candidate = REPO_ROOT / rel
         if candidate.exists():
             return str(candidate)
-    return shutil.which("python3") or shutil.which("python") or sys.executable
+    if sys.executable and Path(sys.executable).exists():
+        return sys.executable
+    for name in ("python", "python3"):
+        found = shutil.which(name)
+        if found and "WindowsApps" not in found:
+            return found
+    return sys.executable or "python3"
 
 
 def _python_can_run_webui_and_agent(python_exe: str, agent_dir: Path | None = None) -> bool:
@@ -263,6 +268,12 @@ def hermes_command_exists() -> bool:
 
 def install_hermes_agent() -> None:
     info(f"Hermes Agent not found. Attempting install via {INSTALLER_URL}")
+    if platform.system() == "Windows" and not is_wsl():
+        raise RuntimeError(
+            "Hermes Agent was not found. Native Windows bootstrap cannot run "
+            "the POSIX install.sh installer; install Hermes Agent first or set "
+            "HERMES_WEBUI_AGENT_DIR to a local hermes-agent checkout."
+        )
     subprocess.run(
         ["/bin/bash", "-lc", f"curl -fsSL {INSTALLER_URL} | bash"], check=True
     )

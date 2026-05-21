@@ -103,7 +103,15 @@ cd hermes-webui
 python3 bootstrap.py
 ```
 
-Or keep using the shell launcher:
+On native Windows, use PowerShell:
+
+```powershell
+git clone https://github.com/nesquena/hermes-webui.git hermes-webui
+cd hermes-webui
+.\start.ps1
+```
+
+Or keep using the shell launcher on Linux, macOS, or WSL:
 
 ```bash
 ./start.sh
@@ -123,15 +131,13 @@ For self-hosted VM or homelab installs, `ctl.sh` wraps the common daemon lifecyc
 
 The bootstrap will:
 
-1. Detect Hermes Agent and, if missing, attempt the official installer (`curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash`).
+1. Detect Hermes Agent and, if missing on Linux, macOS, or WSL, attempt the official installer (`curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash`). On native Windows, install Hermes Agent first or set `HERMES_WEBUI_AGENT_DIR` to a local checkout.
 2. Find or create a Python environment with the WebUI dependencies.
 3. Start the web server and wait for `/health`.
 4. Open the browser unless you pass `--no-browser`.
 5. Drop you into a first-run onboarding wizard inside the WebUI.
 
-> Native Windows is not supported for this bootstrap yet. Use Linux, macOS, or WSL2.
-> For Windows / WSL auto-start at login, see [`docs/wsl-autostart.md`](docs/wsl-autostart.md).
-> A community-maintained native Windows guide is tracked in [#1952](https://github.com/nesquena/hermes-webui/issues/1952).
+For Windows / WSL auto-start at login, see [`docs/wsl-autostart.md`](docs/wsl-autostart.md).
 
 If provider setup is still incomplete after install, the onboarding wizard will point you to finish it with `hermes model` instead of trying to replicate the full CLI setup in-browser.
 For a step-by-step walkthrough of the wizard, provider choices, local model server Base URLs, and safe re-runs, see [`docs/onboarding.md`](docs/onboarding.md).

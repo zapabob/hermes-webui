@@ -49,10 +49,11 @@ def test_onboarding_uses_i18n_helpers():
     assert "onboarding_title: 'Bienvenido a Hermes Web UI'" in i18n
 
 
-def test_bootstrap_script_contains_official_installer_and_windows_guard():
+def test_bootstrap_script_contains_official_installer_and_windows_guidance():
     src = read("bootstrap.py")
     assert (
         "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh"
         in src
     )
-    assert "Native Windows is not supported" in src
+    assert "Native Windows bootstrap cannot run" in src
+    assert "HERMES_WEBUI_AGENT_DIR" in src

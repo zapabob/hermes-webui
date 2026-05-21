@@ -74,6 +74,15 @@ HERMES_WEBUI_PORT=8789 \
 python3 bootstrap.py
 ```
 
+On native Windows, use PowerShell syntax:
+
+```powershell
+$env:HERMES_HOME="$HOME\hermes-onboarding-test\.hermes"
+$env:HERMES_WEBUI_STATE_DIR="$HOME\hermes-onboarding-test\webui"
+$env:HERMES_WEBUI_PORT="8789"
+python bootstrap.py
+```
+
 Open:
 
 ```text

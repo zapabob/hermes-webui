@@ -18,25 +18,25 @@ below.
 Hermes WebUI is only the browser interface. The actual agent runtime, memory,
 skills, config, cron jobs, and provider credentials belong to Hermes Agent.
 
-The bootstrap supports Linux, macOS, and WSL2. Native Windows is not supported
-by the bootstrap yet. A community native Windows setup is being tracked in
-[#1952](https://github.com/nesquena/hermes-webui/issues/1952), including:
+The bootstrap supports Linux, macOS, WSL2, and native Windows. On native
+Windows, install Hermes Agent first or set `HERMES_WEBUI_AGENT_DIR` to a local
+Hermes Agent checkout because the optional POSIX `install.sh` fallback cannot
+run there. Start from PowerShell with:
 
-- [Native Windows guide](https://github.com/markwang2658/hermes-windows-native-guide)
-- [Native Windows setup scripts](https://github.com/markwang2658/hermes-windows-native)
+```powershell
+.\start.ps1
+```
 
-For Windows users who want the supported path today, use WSL2 and see
-[Windows / WSL auto-start](wsl-autostart.md).
+For Windows / WSL auto-start, see [Windows / WSL auto-start](wsl-autostart.md).
 
 ## Install path choices
 
 | Path | Use it when | Notes |
 |---|---|---|
-| Local bootstrap | You run WebUI directly on Linux, macOS, or WSL2 | Best for a personal server, Mac mini, VPS, or homelab host. |
+| Local bootstrap | You run WebUI directly on Linux, macOS, WSL2, or native Windows | Best for a personal server, Mac mini, VPS, Windows workstation, or homelab host. |
 | Docker single-container | You want the simplest container setup | Recommended first Docker path. WebUI runs the agent in-process. |
 | Docker two-container | You already run the agent gateway separately | More isolated, but tools launched from WebUI run in the WebUI container. |
 | Docker three-container | You want agent gateway plus dashboard plus WebUI | Same caveats as two-container, plus the dashboard service. |
-| Native Windows community path | You are intentionally testing unsupported native Windows | Community-maintained for now, not the official bootstrap path. |
 
 If a Docker install gets confusing, start again with the single-container setup.
 It avoids most UID/GID, source-volume, and tool-location surprises. See
@@ -173,8 +173,8 @@ isolated test install.
 File an issue when the diagnostics point to WebUI rather than local
 configuration. Include:
 
-1. Install path: local bootstrap, Docker single-container, Docker
-   two-container, Docker three-container, WSL2, or community native Windows.
+1. Install path: local bootstrap, native Windows, Docker single-container,
+   Docker two-container, Docker three-container, or WSL2.
 2. Output from `/health`, or the startup banner if the server never starts.
 3. The provider selected in onboarding and the Base URL shape, with secrets
    redacted.

@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Native Windows bootstrap support via `start.ps1`, Windows-safe Python discovery, and direct `bootstrap.py` startup when `HERMES_WEBUI_AGENT_DIR` points at an existing Hermes Agent checkout. The POSIX `install.sh` fallback remains Linux/macOS/WSL-only and now fails with a Windows-specific setup hint instead of blocking all native Windows starts.
+
 
 ## [v0.51.103] — 2026-05-21 — Release CA (stage-396 — 1-PR follow-on — Settings → Plugins distinguishes exclusive/provider activation)
 
