@@ -3012,6 +3012,7 @@ def get_available_models() -> dict:
                 "XIAOMI_API_KEY",
                 "OPENCODE_ZEN_API_KEY",
                 "OPENCODE_GO_API_KEY",
+                "OPENCODE_API_KEY",
                 "MINIMAX_API_KEY",
                 "MINIMAX_CN_API_KEY",
                 "XAI_API_KEY",
@@ -3051,9 +3052,9 @@ def get_available_models() -> dict:
                 detected_providers.add("x-ai")
             if all_env.get("MISTRAL_API_KEY"):
                 detected_providers.add("mistralai")
-            if all_env.get("OPENCODE_ZEN_API_KEY"):
+            if all_env.get("OPENCODE_ZEN_API_KEY") or all_env.get("OPENCODE_API_KEY"):
                 detected_providers.add("opencode-zen")
-            if all_env.get("OPENCODE_GO_API_KEY"):
+            if all_env.get("OPENCODE_GO_API_KEY") or all_env.get("OPENCODE_API_KEY"):
                 detected_providers.add("opencode-go")
             # LM Studio: detect via LM_API_KEY + LM_BASE_URL in ~/.hermes/.env
             if all_env.get("LM_API_KEY") and all_env.get("LM_BASE_URL"):
