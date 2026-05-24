@@ -3,6 +3,32 @@
 
 ## [Unreleased]
 
+## [v0.51.125] — 2026-05-24 — Release CW (stage-batch7 — 10-PR low-risk batch — UI/UX polish + bug fixes + diagnostics)
+
+### Fixed
+
+- **PR #2839** by @tn801534 — Kanban worker log endpoint constructed URLs with a double query string (`?board=<slug>?tail=65536`) when a non-default board was active. The frontend was appending `?tail=65536` directly to a URL that already had `?board=...` from `_kanbanBoardQuery()`. Fix: pass `{tail: 65536}` as the `extra` argument to `_kanbanBoardQuery()` so it composes both params into a single valid query string. One-line, narrow scope.
+
+- **PR #2832** by @franksong2702 — Malformed HTTP request logging in `server.py` falls back to `"-"` for missing `command` or `path` instead of raising `AttributeError`. Defensive `getattr(self, 'command', None) or '-'` matches the pattern already used for `_req_t0` elsewhere in the handler. Adds `tests/test_issue2775_log_request.py` covering the malformed-request-before-path-assigned case.
+
+- **PR #2818** by @humayunak — Approval and clarify cards no longer steal focus from the composer textarea (`#msg`) when the user is mid-type. `showApprovalCard()` and `showClarifyCard()` now guard the `focus()` call on `document.activeElement !== $('msg')`, matching the pattern already used elsewhere for focus-sensitive paths. The clarify card also moves the focus call out of `setTimeout` for snappier UX. Silently dropped keystrokes during streaming are eliminated.
+
+- **PR #2826** by @Koraji95-coder — Composer footer chip wraps no longer overlap at narrow widths (closes #2740). The five chip wraps (`.composer-profile-wrap`, `.composer-ws-wrap`, `.composer-model-wrap`, `.composer-reasoning-wrap`, `.composer-toolsets-wrap`) had `flex: 0 1 auto` + `min-width: 0` so they would compress past their content's natural width when the composer narrowed, causing visual overlap of the profile / workspace / model / reasoning chips. Switched to `flex: 0 0 auto` via a single grouped selector. Each chip now keeps its natural width and the existing `overflow-x: auto` on `.composer-left` handles overflow via horizontal scroll. Default-width layout unchanged; only affects the overflow regime. Mobile-specific rules (already `flex: 0 0 auto`) untouched.
+
+- **PR #2829** by @franksong2702 — Workspace Markdown previews fall back to plain text for very large files (>64 KB or >1500 lines) instead of synchronously running the full rich Markdown renderer on the browser main thread, which could lock up the tab for several seconds on multi-megabyte `.md` files. Plain-text preview shows file size + line count in the status line so users know why rich rendering was bypassed; Edit mode still shows raw content as before. Closes #2823. Supersedes #2828 (same scope, less polished).
+
+- **PR #2837** by @franksong2702 — CSRF rejections now distinguish origin/proxy mismatches from expired session tokens, so provider-key removal and other protected requests show actionable diagnostics instead of the generic "Cross-origin request rejected" error. Adds `tests/test_issue2572_csrf_diagnostics.py` covering both failure modes.
+
+- **PR #2834** by @franksong2702 — Workspace Markdown `mailto:` and `tel:` links now render as clickable links, and sandboxed HTML preview links open outside the iframe (via injected `<base target="_blank">`) instead of navigating the preview into a browser-blocked page. Adds `tests/test_issue2768_workspace_links.py`.
+
+- **PR #2838** by @franksong2702 — Tasks panel surfaces a warning when the Hermes gateway is not configured or not running, so Docker users know scheduled jobs need the gateway daemon to tick while away. The single-container Docker boundary is also clarified in `docs/docker.md`. Adds `tests/test_issue2785_gateway_cron_guidance.py`.
+
+### Added
+
+- **PR #2820** by @tangerine-fan — Clarify user choice is now echoed as a visible message in the conversation transcript. After the user responds to a clarify prompt, a synthetic user message with the chosen value is inserted into `S.messages` (marked `_clarify_response: true` so downstream consumers can filter if needed). Previously the choice was only visible in the transient clarify card; now the chat history preserves the decision.
+
+- **PR #2843** by @AJV20 — New Settings preference "Ignore Agent updates" keeps WebUI update notices, banners, and update actions enabled while suppressing Hermes Agent update checks. Default `False` (current behavior). Useful when running an unreleased agent build or pinning to a specific agent commit.
+
 ## [v0.51.124] — 2026-05-24 — Release CV (stage-batch6 — 3-PR Windows-only stack — agent paths / docs / port hardening)
 
 ### Added

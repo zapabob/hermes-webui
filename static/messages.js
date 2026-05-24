@@ -2428,7 +2428,9 @@ function showApprovalCard(pending, pendingCount) {
   card.classList.add("visible");
   if (typeof applyLocaleToDOM === "function") applyLocaleToDOM();
   const onceBtn = $("approvalBtnOnce");
-  if (onceBtn) setTimeout(() => onceBtn.focus({preventScroll: true}), 50);
+  if (onceBtn && document.activeElement !== $('msg')) {
+    setTimeout(() => onceBtn.focus({preventScroll: true}), 50);
+  }
 }
 
 async function respondApproval(choice) {
@@ -2864,7 +2866,11 @@ function showClarifyCard(pending) {
   card.classList.add("visible");
   _syncClarifyCollapseButton(card);
   if (typeof applyLocaleToDOM === "function") applyLocaleToDOM();
-  if (input && !sameClarify) setTimeout(() => input.focus({preventScroll: true}), 50);
+  // Move focus to clarify input synchronously (not in setTimeout) and
+  // only if the user wasn't mid-type in the composer textarea.
+  if (input && !sameClarify && document.activeElement !== $('msg')) {
+    input.focus({preventScroll: true});
+  }
 }
 
 async function respondClarify(response) {
@@ -2896,6 +2902,16 @@ async function respondClarify(response) {
         _clarifyId = null;
         _clearClarifyPendingForSession(sid);
         hideClarifyCard(true, 'sent');
+        // Echo the user's clarify choice as a visible message in the conversation
+        if (S.session && S.session.session_id === sid) {
+          S.messages.push({
+            role: 'user',
+            content: value,
+            _clarify_response: true,
+            _ts: Date.now() / 1000,
+          });
+          if (typeof renderMessages === 'function') renderMessages({preserveScroll: true});
+        }
       }
     } else {
       // Stale / expired / wrong session — keep the card and draft visible.

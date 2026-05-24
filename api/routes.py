@@ -1260,8 +1260,37 @@ def _csrf_exempt_path(path: str) -> bool:
     return path in {"/api/auth/login", "/api/csp-report"}
 
 
+_CSRF_FAILURE_ATTR = "_hermes_csrf_failure_reason"
+
+
+def _set_csrf_failure_reason(handler, reason: str) -> bool:
+    try:
+        setattr(handler, _CSRF_FAILURE_ATTR, reason)
+    except Exception:
+        pass
+    return False
+
+
+def _clear_csrf_failure_reason(handler) -> None:
+    try:
+        if hasattr(handler, _CSRF_FAILURE_ATTR):
+            delattr(handler, _CSRF_FAILURE_ATTR)
+    except Exception:
+        pass
+
+
+def _csrf_rejection_error(handler) -> str:
+    reason = getattr(handler, _CSRF_FAILURE_ATTR, "")
+    if reason == "origin_mismatch":
+        return "Cross-origin mismatch - check reverse proxy headers"
+    if reason == "token_mismatch":
+        return "Session expired - reload the page"
+    return "Cross-origin request rejected"
+
+
 def _check_csrf(handler) -> bool:
     """Reject cross-origin or tokenless authenticated browser unsafe requests."""
+    _clear_csrf_failure_reason(handler)
     origin = handler.headers.get("Origin", "")
     referer = handler.headers.get("Referer", "")
     host = handler.headers.get("Host", "")
@@ -1271,7 +1300,7 @@ def _check_csrf(handler) -> bool:
     # Extract host:port from origin/referer
     m = _re.match(r"^https?://([^/]+)", target)
     if not m:
-        return False
+        return _set_csrf_failure_reason(handler, "origin_mismatch")
     origin_host = m.group(1)
     origin_scheme = m.group(0).split('://')[0].lower()  # 'http' or 'https'
     origin_name, origin_port = _normalize_host_port(origin_host)
@@ -1299,7 +1328,7 @@ def _check_csrf(handler) -> bool:
                 origin_allowed = True
                 break
     if not origin_allowed:
-        return False
+        return _set_csrf_failure_reason(handler, "origin_mismatch")
 
     from api.auth import CSRF_HEADER_NAME, is_auth_enabled, parse_cookie, verify_csrf_token
 
@@ -1307,7 +1336,9 @@ def _check_csrf(handler) -> bool:
         return True
     cookie_val = parse_cookie(handler)
     submitted = handler.headers.get(CSRF_HEADER_NAME) or handler.headers.get("X-CSRF-Token")
-    return verify_csrf_token(cookie_val or "", submitted or "")
+    if verify_csrf_token(cookie_val or "", submitted or ""):
+        return True
+    return _set_csrf_failure_reason(handler, "token_mismatch")
 
 
 def _client_ip_for_rate_limit(handler) -> str:
@@ -4260,6 +4291,7 @@ def handle_get(handler, parsed) -> bool:
         settings = load_settings()
         if not settings.get("check_for_updates", True):
             return j(handler, {"disabled": True})
+        include_agent_updates = not bool(settings.get("ignore_agent_updates"))
         qs = parse_qs(parsed.query)
         force = qs.get("force", ["0"])[0] == "1"
         # ?simulate=1 returns fake behind counts for UI testing (localhost only)
@@ -4281,7 +4313,8 @@ def handle_get(handler, parsed) -> bool:
                     },
                     "agent": {
                         "name": "agent",
-                        "behind": 1,
+                        "behind": 1 if include_agent_updates else 0,
+                        "ignored": not include_agent_updates,
                         "current_sha": "aaa0001",
                         "latest_sha": "bbb0002",
                         "branch": "master",
@@ -4293,7 +4326,7 @@ def handle_get(handler, parsed) -> bool:
             )
         from api.updates import check_for_updates
 
-        return j(handler, check_for_updates(force=force))
+        return j(handler, check_for_updates(force=force, include_agent=include_agent_updates))
 
     if parsed.path == "/api/chat/stream/status":
         stream_id = parse_qs(parsed.query).get("stream_id", [""])[0]
@@ -4614,7 +4647,7 @@ def handle_post(handler, parsed) -> bool:
         diag.stage("csrf")
     if not _csrf_exempt_path(parsed.path) and not _check_csrf(handler):
         try:
-            return j(handler, {"error": "Cross-origin request rejected"}, status=403)
+            return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
         finally:
             if diag:
                 diag.finish()
@@ -6194,7 +6227,7 @@ def handle_post(handler, parsed) -> bool:
 def handle_patch(handler, parsed) -> bool:
     """Handle all PATCH routes. Returns True if handled, False for 404."""
     if not _check_csrf(handler):
-        return j(handler, {"error": "Cross-origin request rejected"}, status=403)
+        return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
     body = read_body(handler)
     if parsed.path.startswith("/api/kanban/"):
         from api.kanban_bridge import handle_kanban_patch
@@ -6209,7 +6242,7 @@ def handle_patch(handler, parsed) -> bool:
 def handle_delete(handler, parsed) -> bool:
     """Handle all DELETE routes. Returns True if handled, False for 404."""
     if not _check_csrf(handler):
-        return j(handler, {"error": "Cross-origin request rejected"}, status=403)
+        return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
     body = read_body(handler)
     if parsed.path.startswith("/api/kanban/"):
         from api.kanban_bridge import handle_kanban_delete
@@ -6875,6 +6908,51 @@ def _serve_file_bytes(handler, target: Path, mime: str, disposition: str, cache_
     return True
 
 
+def _html_preview_with_blank_base(raw: bytes) -> bytes:
+    base = '<base target="_blank">'
+    text = raw.decode("utf-8", errors="replace")
+    if re.search(r"<head(?:\s[^>]*)?>", text, flags=re.IGNORECASE):
+        text = re.sub(r"(<head\b[^>]*>)", r"\1" + base, text, count=1, flags=re.IGNORECASE)
+    elif re.search(r"<!doctype[^>]*>", text, flags=re.IGNORECASE):
+        text = re.sub(
+            r"(<!doctype[^>]*>)",
+            r"\1<head>" + base + "</head>",
+            text,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+    else:
+        text = "<head>" + base + "</head>" + text
+    return text.encode("utf-8")
+
+
+def _serve_inline_html_preview(handler, target: Path, cache_control: str, *, csp: str):
+    """Serve sandboxed workspace HTML preview with links targeting a new tab."""
+    try:
+        body = _html_preview_with_blank_base(target.read_bytes())
+    except PermissionError:
+        return bad(handler, "Permission denied", 403)
+    except Exception:
+        return bad(handler, "Could not read file", 500)
+
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/html; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Accept-Ranges", "none")
+    handler.send_header("Cache-Control", cache_control)
+    handler.send_header("Content-Disposition", _content_disposition_value("inline", target.name))
+    handler.send_header("Content-Security-Policy", csp)
+    handler.send_header("X-Content-Type-Options", "nosniff")
+    handler.send_header("Referrer-Policy", "same-origin")
+    handler.send_header(
+        "Permissions-Policy",
+        "camera=(), microphone=(self), geolocation=(), clipboard-write=(self)",
+    )
+    handler.end_headers()
+    handler.wfile.write(body)
+    return True
+
+
 def _handle_media(handler, parsed):
     """Serve a local file by absolute path for inline display in the chat.
 
@@ -7180,8 +7258,10 @@ def _handle_file_raw(handler, parsed):
     # CSP sandbox directive applies the same isolation server-side: without
     # allow-same-origin, the document is treated as a unique opaque origin and
     # cannot read WebUI cookies, localStorage, or postMessage to the parent.
-    csp = "sandbox allow-scripts" if html_inline_ok else None
+    csp = "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox" if html_inline_ok else None
     # _serve_file_bytes sends Content-Security-Policy when csp is set.
+    if html_inline_ok:
+        return _serve_inline_html_preview(handler, target, "no-store", csp=csp)
     return _serve_file_bytes(handler, target, mime, disposition, "no-store", csp=csp)
 
 
