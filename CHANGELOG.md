@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Installed/mobile PWA sessions now support an edge swipe from the left side of the screen to open the mobile sidebar drawer, while preserving the existing hamburger and overlay controls.
+
 ### Fixed
 
 - New WebUI sessions no longer persist `display.personality` into per-session `Session.personality`; only explicit personality changes remain durable, preventing stale global display defaults from overriding profile-scoped session behavior. Closes #2845.
