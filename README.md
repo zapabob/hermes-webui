@@ -45,6 +45,28 @@ This gives you nearly **1:1 parity with Hermes CLI from a convenient web UI** wh
 
 ---
 
+## Local fork highlights
+
+This fork tracks the official `nesquena/hermes-webui` API and release stream,
+with the current merge including upstream `v0.51.137`. Local changes are kept
+small and operational:
+
+- **Official-first merge flow:** `scripts/merge_official_updates.py` fetches the
+  official upstream, summarizes local-only and upstream-only commits, previews
+  conflicts, and then runs the merge so future updates stay repeatable.
+- **OpenClaw bridge compatibility:** a shared `OPENCODE_API_KEY` now enables
+  both OpenCode Zen and OpenCode Go provider groups, while the existing
+  official `OPENCODE_ZEN_API_KEY` and `OPENCODE_GO_API_KEY` paths continue to
+  work unchanged.
+- **Native Windows convenience wrapper:** `scripts/windows/start-hermes-webui-native.ps1`
+  sets the common native-Windows WebUI environment and delegates to the tracked
+  `start.ps1`, preserving the official launcher behavior underneath.
+- **Upstream API follow-through:** local provider and launcher behavior is
+  layered on top of the official config, bootstrap, and Windows path defaults
+  instead of replacing those contracts.
+
+---
+
 ## Why Hermes
 
 Most AI tools reset every session. They don't know who you are, what you worked on, or what

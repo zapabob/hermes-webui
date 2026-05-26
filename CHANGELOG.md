@@ -6,6 +6,7 @@
 ### Added
 
 - Add `scripts/merge_official_updates.py` for repeatable official upstream fetch/merge runs while preserving local commits.
+- Highlight this fork's local upstream-merge, OpenClaw/OpenCode, and native Windows wrapper differences in `README.md`.
 
 ### Fixed
 
