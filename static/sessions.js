@@ -470,6 +470,20 @@ async function newSession(flash, options={}){
     if(S.session&&S.session.session_id) reqBody.prev_session_id=S.session.session_id;
     if(options&&options.worktree) reqBody.worktree=true;
     if(_activeProject&&_activeProject!==NO_PROJECT_FILTER) reqBody.project_id=_activeProject;
+    // Carry the visible picker selection into the new session. Without this,
+    // /api/session/new falls back to config.yaml defaults (e.g. gpt-5.5) even
+    // when the user already chose cursor/composer-2.5 in the composer chip.
+    const modelSelForNew=$('modelSelect');
+    let newModelState=null;
+    if(modelSelForNew&&modelSelForNew.value&&typeof _modelStateForSelect==='function'){
+      newModelState=_modelStateForSelect(modelSelForNew,modelSelForNew.value);
+    }else if(typeof _readPersistedModelState==='function'){
+      newModelState=_readPersistedModelState();
+    }
+    if(newModelState&&newModelState.model){
+      reqBody.model=newModelState.model;
+      reqBody.model_provider=newModelState.model_provider||null;
+    }
     const data=await api('/api/session/new',{method:'POST',body:JSON.stringify(reqBody)});
     S.session=data.session;S.messages=data.session.messages||[];
     S.lastUsage={...(data.session.last_usage||{})};
@@ -890,6 +904,29 @@ function _isCliSession(session) {
   // If messaging-like, don't classify as legacy CLI even when is_cli_session is true.
   if (_isMessagingSession(session)) return false;
   return session.is_cli_session === true;
+}
+
+function _sessionSourceLabel(filter, count) {
+  const n = Number(count) || 0;
+  return filter === 'cli' ? `CLI sessions (${n})` : `WebUI sessions (${n})`;
+}
+
+function _setSessionSourceFilter(filter) {
+  const next = filter === 'cli' ? 'cli' : 'webui';
+  if (_sessionSourceFilter === next) return;
+  _sessionSourceFilter = next;
+  _activeProject = null;
+  _selectedSessions.clear();
+  _sessionSelectMode = false;
+  try { localStorage.setItem('hermes-session-source-filter', next); } catch (_e) {}
+  renderSessionListFromCache();
+}
+
+function _restoreSessionSourceFilter() {
+  try {
+    const raw = localStorage.getItem('hermes-session-source-filter');
+    if (raw === 'cli' || raw === 'webui') _sessionSourceFilter = raw;
+  } catch (_e) {}
 }
 
 function _normalizeMessageForCliImportComparison(message) {
@@ -1537,6 +1574,8 @@ const NO_PROJECT_FILTER = '__none__';
 let _activeProject = null;  // project_id filter (null = show all, NO_PROJECT_FILTER = unassigned only)
 let _showAllProfiles = false;  // false = filter to active profile only
 let _otherProfileCount = 0;       // count of sessions from other profiles (server-reported)
+let _sessionSourceFilter = 'webui';  // 'webui' keeps WebUI chats separate from read-only CLI sessions
+_restoreSessionSourceFilter();
 let _sessionActionMenu = null;
 let _sessionActionAnchor = null;
 let _sessionActionSessionId = null;
@@ -3224,6 +3263,14 @@ function renderSessionListFromCache(){
     (activeSidForSidebar&&s.session_id===activeSidForSidebar) ||
     (S.session&&s.session_id===S.session.session_id&&(S.session.message_count||0)>0)
   );
+  const webuiSessionCount = withMessages.filter(s=>!_isCliSession(s)).length;
+  const cliSessionCount = withMessages.filter(s=>_isCliSession(s)).length;
+  if(_sessionSourceFilter==='cli' && !window._showCliSessions && cliSessionCount===0){
+    _sessionSourceFilter='webui';
+  }
+  const sourceFiltered = _sessionSourceFilter==='cli'
+    ? withMessages.filter(s=>_isCliSession(s))
+    : withMessages.filter(s=>!_isCliSession(s));
   // The server is authoritative for profile scoping (#1611): it filters by
   // active profile when no query param is set, and returns the aggregate when
   // we send ?all_profiles=1. The renamed-root cross-alias (a row tagged
@@ -3231,7 +3278,7 @@ function renderSessionListFromCache(){
   // in _profiles_match, and a strict-equality client filter would reject those
   // rows incorrectly. So we trust the wire data and skip the redundant client
   // filter entirely.
-  const profileFiltered=withMessages;
+  const profileFiltered=sourceFiltered;
   // Filter by active project. NO_PROJECT_FILTER sentinel asks for sessions
   // with no project_id; otherwise filter to the matching project_id, or
   // pass through when no filter is active.
@@ -3271,6 +3318,21 @@ function renderSessionListFromCache(){
   list.appendChild(batchBar);
   if(_sessionSelectMode&&_selectedSessions.size>0){batchBar.style.display='flex';_renderBatchActionBar();}
   else{batchBar.style.display='none';}
+  if(window._showCliSessions || cliSessionCount>0){
+    const sourceTabs=document.createElement('div');
+    sourceTabs.className='session-source-tabs';
+    for(const filter of ['webui','cli']){
+      const count=filter==='cli'?cliSessionCount:webuiSessionCount;
+      const btn=document.createElement('button');
+      btn.type='button';
+      btn.className='session-source-tab'+(_sessionSourceFilter===filter?' active':'');
+      btn.textContent=_sessionSourceLabel(filter,count);
+      btn.setAttribute('aria-pressed', _sessionSourceFilter===filter?'true':'false');
+      btn.onclick=()=>_setSessionSourceFilter(filter);
+      sourceTabs.appendChild(btn);
+    }
+    list.appendChild(sourceTabs);
+  }
   // Project filter bar — show when there are real projects OR there are
   // unassigned sessions (so the Unassigned chip has something to filter to).
   const hasUnprojected=profileFiltered.some(s=>!s.project_id);
@@ -3353,9 +3415,14 @@ function renderSessionListFromCache(){
     list.appendChild(toggle);
   }
   // Empty state for active project filter
-  if(_activeProject&&sessions.length===0){
+  if(_sessionSourceFilter==='cli'&&sessions.length===0){
     const empty=document.createElement('div');
-    empty.style.cssText='padding:20px 14px;color:var(--muted);font-size:12px;text-align:center;opacity:.7;';
+    empty.className='session-empty-note';
+    empty.textContent=window._showCliSessions?'No CLI sessions found.':'Enable Show agent sessions in Settings to list CLI sessions here.';
+    list.appendChild(empty);
+  } else if(_activeProject&&sessions.length===0){
+    const empty=document.createElement('div');
+    empty.className='session-empty-note';
     empty.textContent=_activeProject===NO_PROJECT_FILTER?'No unassigned sessions.':'No sessions in this project yet.';
     list.appendChild(empty);
   }
