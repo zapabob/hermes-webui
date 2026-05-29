@@ -18,6 +18,13 @@ from pathlib import Path
 DEFAULT_OFFICIAL_URL = "https://github.com/nesquena/hermes-webui.git"
 
 
+def configure_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
 def run_git(args: list[str], repo: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", *args],
@@ -70,6 +77,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    configure_stdio()
     args = parse_args()
     repo = ensure_repo(Path(args.repo).resolve())
     target_ref = f"refs/remotes/{args.remote_name}/{args.official_ref}"
