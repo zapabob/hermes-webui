@@ -5,6 +5,8 @@ import time
 
 import pytest
 
+pytest.importorskip("fcntl", reason="POSIX fcntl terminal backend unavailable on this host")
+
 import api.terminal as terminal
 
 

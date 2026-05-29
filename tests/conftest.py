@@ -17,6 +17,7 @@ import json
 import os
 import pathlib
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -295,6 +296,14 @@ def _hermes_addr_is_local(host: str) -> bool:
     return False
 
 
+def _rmtree_force(path: pathlib.Path) -> None:
+    def _handle_remove_readonly(func, target, _exc_info):
+        os.chmod(target, stat.S_IWRITE)
+        func(target)
+
+    shutil.rmtree(path, onerror=_handle_remove_readonly)
+
+
 def _hermes_blocked_create_connection(address, *a, **kw):
     try:
         host = address[0]
@@ -477,7 +486,7 @@ def test_server():
 
     # Clean slate
     if TEST_STATE_DIR.exists():
-        shutil.rmtree(TEST_STATE_DIR)
+        _rmtree_force(TEST_STATE_DIR)
     TEST_STATE_DIR.mkdir(parents=True)
     TEST_WORKSPACE.mkdir(parents=True)
 
@@ -607,7 +616,7 @@ def test_server():
         proc.kill()
 
     try:
-        shutil.rmtree(TEST_STATE_DIR)
+        _rmtree_force(TEST_STATE_DIR)
     except Exception:
         pass
 
