@@ -13,6 +13,7 @@
 
 - Add regression coverage for Git-backed WebUI version detection on Windows legacy-console decode failures, including missing capture buffers after decode-thread failures.
 - Agent/WebUI update checks now ignore local release tags that are missing from the configured update remote, preventing fork checkouts with upstream-only tags from advertising an update that `git pull origin <tag>` cannot fetch.
+- Native Windows startup now prefers an Agent `.venv` interpreter when present before falling back to the legacy `venv` path.
 
 ## [v0.51.190] — 2026-05-31 — Release FJ (stage-batch2 — Windows upgrade state-stranding hotfix + gateway banner + quiet tool previews)
 

@@ -130,7 +130,10 @@ if (-not $AgentDir) {
 }
 
 # === Prefer the agent's venv Python if available =======================
-$agentVenvPython = Join-Path $AgentDir 'venv\Scripts\python.exe'
+$agentVenvPython = Join-Path $AgentDir '.venv\Scripts\python.exe'
+if (-not (Test-Path $agentVenvPython) -or -not (Test-Path (Join-Path $AgentDir '.venv\pyvenv.cfg'))) {
+    $agentVenvPython = Join-Path $AgentDir 'venv\Scripts\python.exe'
+}
 if (Test-Path $agentVenvPython) {
     $Python = $agentVenvPython
 }
