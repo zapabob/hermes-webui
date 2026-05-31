@@ -3,7 +3,6 @@ Tests for OpenCode Zen and OpenCode Go provider support.
 Verifies provider registration in display/model catalogs and
 env-var fallback detection.
 """
-import os
 import sys
 import types
 import pytest
@@ -97,7 +96,7 @@ def test_opencode_go_detected_via_env_key(monkeypatch):
 
 
 def test_shared_opencode_api_key_detects_zen_and_go(monkeypatch):
-    """OpenClaw bridge sets one shared OPENCODE_API_KEY for both OpenCode surfaces."""
+    """A shared OpenCode bridge key should enable both OpenCode surfaces."""
     fake_mod = types.ModuleType("hermes_cli.models")
     fake_mod.list_available_providers = None
     monkeypatch.setitem(sys.modules, "hermes_cli.models", fake_mod)
@@ -140,7 +139,9 @@ def test_live_models_handler_delegates_to_provider_model_ids():
     rather than maintain its own per-provider fetch logic.
     """
     import pathlib
-    routes_src = (pathlib.Path(__file__).parent.parent / "api" / "routes.py").read_text(encoding="utf-8")
+    routes_src = (
+        pathlib.Path(__file__).parent.parent / "api" / "routes.py"
+    ).read_text(encoding="utf-8")
     assert "provider_model_ids" in routes_src, (
         "_handle_live_models must call hermes_cli.models.provider_model_ids() "
         "to delegate all provider-specific live-fetch logic to the agent"
@@ -162,7 +163,9 @@ def test_live_models_ui_no_longer_skips_any_provider():
     handles them all (with graceful fallback to static lists).
     """
     import pathlib
-    ui_src = (pathlib.Path(__file__).parent.parent / "static" / "ui.js").read_text(encoding="utf-8")
+    ui_src = (
+        pathlib.Path(__file__).parent.parent / "static" / "ui.js"
+    ).read_text(encoding="utf-8")
     # The old exclusion list must be gone
     assert "includes(provider)" not in ui_src or "anthropic" not in ui_src[:ui_src.find("includes(provider)")+100], (
         "_fetchLiveModels must not skip anthropic, google, or gemini — "

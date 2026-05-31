@@ -13,6 +13,7 @@ import os
 import queue
 import re
 import platform
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -96,6 +97,25 @@ def _session_field(session, field, default=None):
     if isinstance(session, dict):
         return session.get(field, default)
     return getattr(session, field, default)
+
+
+def _session_counts_toward_pin_quota(session) -> bool:
+    """Return True when a pinned session should consume visible pin quota."""
+    if not _session_field(session, "pinned", False):
+        return False
+    if _session_field(session, "archived", False):
+        return False
+    if isinstance(session, dict):
+        row = session
+    elif hasattr(session, "compact"):
+        row = session.compact()
+    else:
+        row = {
+            "pre_compression_snapshot": _session_field(session, "pre_compression_snapshot", False),
+            "source_tag": _session_field(session, "source_tag", None),
+            "default_hidden": _session_field(session, "default_hidden", False),
+        }
+    return not _hide_from_default_sidebar(row)
 
 
 # ── Profile-scoped session/project filtering (#1611, #1614) ────────────────
@@ -211,6 +231,62 @@ def _worktree_retained_payload_for_session_id(sid: str) -> dict:
         return {}
 
 
+def _active_profile_config_path() -> Path:
+    """Return config.yaml for the request's active WebUI profile.
+
+    Skills endpoints are profile-scoped UI actions: both the visible disabled
+    toggle state and toggle writes must follow the cookie/thread-local active
+    Hermes home, not process-global HERMES_HOME or HERMES_CONFIG_PATH values
+    captured at server startup.
+    """
+    test_override_module = getattr(_get_config_path, "__module__", "")
+    if test_override_module != "api.config":
+        return _get_config_path()
+    try:
+        from api.profiles import get_active_hermes_home
+
+        return Path(get_active_hermes_home()) / "config.yaml"
+    except Exception:
+        return _get_config_path()
+
+
+def _get_disabled_skill_names_for_profile() -> set:
+    """Read disabled skill names from the active profile's config.yaml.
+
+    Unlike ``tools.skills_tool._get_disabled_skill_names`` which reads from
+    the process-global ``HERMES_HOME``, this uses ``_get_config_path()`` which
+    resolves against the WebUI's active profile.  Checks
+    ``skills.platform_disabled.webui`` first, falling back to
+    ``skills.disabled``.
+    """
+    config_path = _active_profile_config_path()
+    if not config_path.exists():
+        return set()
+    try:
+        cfg = _load_yaml_config_file(config_path)
+    except Exception:
+        return set()
+    if not isinstance(cfg, dict):
+        return set()
+    skills_cfg = cfg.get("skills")
+    if not isinstance(skills_cfg, dict):
+        return set()
+    # Check platform_disabled.webui first (mirrors agent platform resolution)
+    platform_disabled = skills_cfg.get("platform_disabled")
+    if isinstance(platform_disabled, dict) and "webui" in platform_disabled:
+        return _normalize_disabled_set(platform_disabled["webui"])
+    return _normalize_disabled_set(skills_cfg.get("disabled"))
+
+
+def _normalize_disabled_set(values) -> set:
+    """Normalize a YAML disabled list into a set of stripped strings."""
+    if values is None:
+        return set()
+    if isinstance(values, str):
+        values = [values]
+    return {str(v).strip() for v in values if str(v).strip()}
+
+
 def _skills_list_from_dir(skills_dir: Path, category: str | None = None) -> dict:
     """List skills using an explicit local skills directory.
 
@@ -222,7 +298,6 @@ def _skills_list_from_dir(skills_dir: Path, category: str | None = None) -> dict
     from tools.skills_tool import (
         MAX_DESCRIPTION_LENGTH,
         _EXCLUDED_SKILL_DIRS,
-        _get_disabled_skill_names,
         _parse_frontmatter,
         _sort_skills,
         skill_matches_platform,
@@ -239,7 +314,7 @@ def _skills_list_from_dir(skills_dir: Path, category: str | None = None) -> dict
 
     all_skills = []
     seen_names: set[str] = set()
-    disabled = _get_disabled_skill_names()
+    disabled = _get_disabled_skill_names_for_profile()
     search_dirs = _active_skill_search_dirs(skills_dir)
 
     for scan_dir in search_dirs:
@@ -981,6 +1056,7 @@ from api.helpers import (
     _redact_text,
 )
 from api.agent_health import build_agent_health_payload
+from api.gateway_chat import gateway_chat_config_status
 from api.request_diagnostics import RequestDiagnostics
 from api.system_health import build_system_health_payload
 
@@ -1017,6 +1093,42 @@ def _clear_stale_stream_state(session) -> bool:
     with STREAMS_LOCK:
         stream_alive = stream_id in STREAMS
     if stream_alive:
+        return False
+    try:
+        from api import config as _live_config
+        with _live_config.ACTIVE_RUNS_LOCK:
+            worker_alive = stream_id in (_live_config.ACTIVE_RUNS or {})
+    except Exception:
+        worker_alive = False
+    if worker_alive:
+        logger.debug(
+            "_clear_stale_stream_state: stream %s for session %s missing SSE channel "
+            "but worker bookkeeping is still active; deferring stale cleanup",
+            stream_id,
+            getattr(session, "session_id", "?"),
+        )
+        return False
+    grace_seconds = 30.0
+    try:
+        from api.models import _REPAIR_STALE_PENDING_GRACE_SECONDS
+        grace_seconds = float(_REPAIR_STALE_PENDING_GRACE_SECONDS)
+        pending_started_at = getattr(session, "pending_started_at", None)
+        pending_age = time.time() - float(pending_started_at) if pending_started_at else None
+    except Exception:
+        pending_age = None
+    if (
+        getattr(session, "pending_user_message", None)
+        and pending_age is not None
+        and pending_age < grace_seconds
+    ):
+        logger.debug(
+            "_clear_stale_stream_state: stream %s for session %s missing SSE channel "
+            "but pending turn is %.1fs old; waiting for %.1fs stale-repair grace",
+            stream_id,
+            getattr(session, "session_id", "?"),
+            pending_age,
+            grace_seconds,
+        )
         return False
 
     # ── #1558 P0 safety: if we were handed a metadata-only stub, reload the
@@ -1412,17 +1524,42 @@ def _send_no_content(handler, status: int = 204) -> bool:
     return True
 
 
+def _safe_content_length(handler, max_bytes: int) -> int:
+    raw_length = handler.headers.get("Content-Length", 0)
+    try:
+        length = int(raw_length)
+    except (TypeError, ValueError):
+        try:
+            handler.close_connection = True
+        except Exception:
+            pass
+        raise ValueError(f"Invalid Content-Length: {raw_length!r}")
+    if length < 0:
+        try:
+            handler.close_connection = True
+        except Exception:
+            pass
+        raise ValueError(f"Invalid Content-Length: {length}")
+    if length > max_bytes:
+        try:
+            handler.close_connection = True
+        except Exception:
+            pass
+        raise OverflowError(f"Request body too large ({length} bytes, max {max_bytes})")
+    return length
+
+
 def _read_csp_report_payload(handler):
     try:
-        length = int(handler.headers.get("Content-Length", 0))
-    except Exception:
-        length = 0
-    if length > _CSP_REPORT_MAX_BODY_BYTES:
+        length = _safe_content_length(handler, _CSP_REPORT_MAX_BODY_BYTES)
+    except OverflowError as exc:
         try:
             handler.rfile.read(_CSP_REPORT_MAX_BODY_BYTES)
         except Exception:
             pass
-        return {"discarded": "body_too_large", "bytes": length}
+        return {"discarded": "body_too_large", "error": str(exc)}
+    except ValueError as exc:
+        return {"discarded": "invalid_content_length", "error": str(exc)}
     raw = handler.rfile.read(length) if length else b"{}"
     try:
         return json.loads(raw.decode("utf-8"))
@@ -1505,23 +1642,15 @@ def _sanitize_client_event_payload(payload: dict | None) -> dict:
 
 def _read_client_event_payload(handler) -> dict:
     try:
-        length = int(handler.headers.get("Content-Length", 0))
-    except Exception:
-        length = 0
-    if length > _CLIENT_EVENT_MAX_BODY_BYTES:
+        length = _safe_content_length(handler, _CLIENT_EVENT_MAX_BODY_BYTES)
+    except OverflowError:
         try:
             handler.rfile.read(_CLIENT_EVENT_MAX_BODY_BYTES)
         except Exception:
             pass
-        # Do not leave unread request-body bytes on an HTTP/1.1 keep-alive
-        # socket. Draining an arbitrary oversized body can tie up a worker;
-        # closing the connection after the bounded read preserves framing for
-        # the next request without turning diagnostics into a slow-drain sink.
-        try:
-            handler.close_connection = True
-        except Exception:
-            pass
         return {"event": "discarded", "reason": "body_too_large"}
+    except ValueError:
+        return {"event": "invalid", "reason": "invalid_content_length"}
     raw = handler.rfile.read(length) if length else b"{}"
     try:
         decoded = raw.decode("utf-8")
@@ -2147,7 +2276,13 @@ def _messages_include_tool_metadata(messages) -> bool:
 
 
 def _tool_calls_for_message_window(tool_calls, start_idx: int, message_count: int) -> list:
-    """Keep session-level tool calls that point into a returned message window."""
+    """Keep session-level tool calls that point into a returned message window.
+
+    ``assistant_msg_idx`` is stored in the full transcript coordinate space, but
+    the frontend renders the returned ``messages`` array from index 0. Rebase the
+    index into the returned window so legacy session-level tool cards still
+    anchor to their visible assistant turn after paginated loads.
+    """
     if not isinstance(tool_calls, list) or message_count <= 0:
         return []
     end_idx = start_idx + message_count
@@ -2159,8 +2294,60 @@ def _tool_calls_for_message_window(tool_calls, start_idx: int, message_count: in
         if isinstance(assistant_idx, bool) or not isinstance(assistant_idx, int):
             continue
         if start_idx <= assistant_idx < end_idx:
-            filtered.append(tool_call)
+            rebased = dict(tool_call)
+            rebased["assistant_msg_idx"] = assistant_idx - start_idx
+            filtered.append(rebased)
     return filtered
+
+
+def _message_counts_as_renderable_for_window(message) -> bool:
+    """Return true when a paginated window should include this transcript row.
+
+    Tool result rows are rendered through their assistant anchor or hidden as raw
+    tool output. Empty partial activity rows can be preserved after cancellation
+    to keep thinking/tool details inspectable, but they are not reply text. A
+    tail page containing only transient metadata makes the frontend open to
+    collapsed activity while newer real replies sit behind "load older messages".
+    """
+    if not isinstance(message, dict):
+        return False
+    if _is_empty_partial_activity_message(message):
+        return False
+    role = str(message.get("role") or "").strip().lower()
+    return bool(role and role != "tool")
+
+
+def _message_window_for_display(messages, msg_limit=None, msg_before=None) -> tuple[list, int]:
+    """Return a paginated message window plus its offset in ``messages``.
+
+    The normal fast path is a raw tail window. If that window contains no
+    renderable transcript rows because state.db appended hidden tool rows after
+    the visible assistant tail, shift the window end back to the newest
+    renderable row. This preserves the raw index cursor while avoiding the
+    WebUI blank-transcript trap.
+    """
+    messages = list(messages or [])
+    if msg_before is not None:
+        before_idx = max(0, min(int(msg_before), len(messages)))
+    else:
+        before_idx = len(messages)
+    source = messages[:before_idx]
+    if not source:
+        return [], 0
+    if not msg_limit:
+        return source, 0
+    limit = max(1, int(msg_limit))
+    end_idx = len(source)
+    start_idx = max(0, end_idx - limit)
+    window = source[start_idx:end_idx]
+    if window and not any(_message_counts_as_renderable_for_window(msg) for msg in window):
+        for idx in range(end_idx - 1, -1, -1):
+            if _message_counts_as_renderable_for_window(source[idx]):
+                end_idx = idx + 1
+                start_idx = max(0, end_idx - limit)
+                window = source[start_idx:end_idx]
+                break
+    return window, start_idx
 
 
 def _merged_session_messages_for_display(session, cli_messages=None) -> list:
@@ -2175,6 +2362,12 @@ def _merged_session_messages_for_display(session, cli_messages=None) -> list:
     sidecar_messages = list(getattr(session, "messages", []) or [])
     if cli_messages:
         if sidecar_messages and sidecar_messages != cli_messages:
+            if len(sidecar_messages) >= len(cli_messages):
+                return merge_session_messages_append_only(
+                    sidecar_messages,
+                    cli_messages,
+                    truncation_watermark=getattr(session, "truncation_watermark", None),
+                )
             merged_messages = []
             seen_message_keys = set()
             for msg in sorted(list(cli_messages) + list(sidecar_messages), key=lambda m: (
@@ -2206,25 +2399,55 @@ def _message_summary(messages) -> dict:
 
 
 def _metadata_only_message_summary(sid: str, profile: str | None = None) -> dict:
-    """Return the reconciled message summary used by metadata-only session loads.
+    """Return the cheap message summary used by metadata-only session loads.
 
-    Threads ``profile=`` through to ``get_state_db_session_messages`` so
+    Threads ``profile=`` through to ``get_state_db_session_summary`` so
     background-thread reads land on the correct profile's state.db (per the
     cookie-bound profile selector — fixes the same TLS-vs-thread race the
     #2762 fix addressed for write paths).
+
+    This intentionally does not full-read or merge transcripts.  If state.db has
+    grown beyond the sidecar count, report that growth so active-session polling
+    can refresh.  If state.db only contains restamped replay rows at or below the
+    sidecar count, keep the sidecar metadata so polling does not loop forever on
+    a false "newer transcript" signal.
     """
-    sidecar_session = Session.load(sid)
-    sidecar_messages = []
+    sidecar_session = Session.load_metadata_only(sid)
+    sidecar_count = 0
+    sidecar_last_message_at = 0.0
     if sidecar_session:
-        sidecar_messages = getattr(sidecar_session, "messages", []) or []
-    state_db_messages = get_state_db_session_messages(sid, profile=profile)
-    return _message_summary(
-        merge_session_messages_append_only(
-            sidecar_messages,
-            state_db_messages,
-            truncation_watermark=getattr(sidecar_session, "truncation_watermark", None),
-        )
-    )
+        sidecar_count = _numeric_count(getattr(sidecar_session, "_metadata_message_count", None))
+        if sidecar_count <= 0:
+            sidecar_count = _numeric_count(sidecar_session.compact().get("message_count"))
+        try:
+            sidecar_last_message_at = float(getattr(sidecar_session, "updated_at", 0) or 0)
+        except (TypeError, ValueError):
+            sidecar_last_message_at = 0.0
+        if getattr(sidecar_session, "truncation_watermark", None) is not None:
+            # Intentional: once the user has truncated this sidecar, metadata
+            # polling must keep the sidecar as authoritative.  A full message
+            # load can still apply the watermark-aware merge, but the cheap
+            # metadata path should not treat later state.db rows as external
+            # growth and resurrect turns the user deliberately cut away.
+            return {
+                "message_count": sidecar_count,
+                "last_message_at": sidecar_last_message_at,
+            }
+    state_summary = get_state_db_session_summary(sid, profile=profile)
+    state_count = _numeric_count(state_summary.get("message_count"))
+    try:
+        state_last_message_at = float(state_summary.get("last_message_at") or 0)
+    except (TypeError, ValueError):
+        state_last_message_at = 0.0
+    if state_count > sidecar_count and state_last_message_at > sidecar_last_message_at:
+        return {
+            "message_count": state_count,
+            "last_message_at": state_last_message_at,
+        }
+    return {
+        "message_count": sidecar_count,
+        "last_message_at": sidecar_last_message_at,
+    }
 
 
 def _session_requires_cli_metadata_lookup(session) -> bool:
@@ -2307,6 +2530,75 @@ def _is_cli_session_for_settings(session: dict) -> bool:
     )
 
 
+def _normalize_sidebar_source_flags(session: dict) -> dict:
+    """Return a sidebar row with the frontend CLI flag matching source metadata."""
+    if not isinstance(session, dict):
+        return session
+    normalized = dict(session)
+    normalized["is_cli_session"] = is_cli_session_row(normalized)
+    return normalized
+
+
+def _session_source_is_webui(session: dict) -> bool:
+    """Return True for state.db/sidebar rows that describe WebUI-origin sessions."""
+    if not isinstance(session, dict):
+        return False
+    for key in ("source_tag", "raw_source", "session_source", "source"):
+        if str(session.get(key) or "").strip().lower() == "webui":
+            return True
+    return False
+
+
+def _session_lineage_ids(session: dict) -> set[str]:
+    """Return known ids that identify one logical sidebar lineage."""
+    if not isinstance(session, dict):
+        return set()
+    ids: set[str] = set()
+    for key in ("session_id", "_lineage_root_id", "_lineage_tip_id"):
+        value = session.get(key)
+        if value:
+            ids.add(str(value))
+    return ids
+
+
+def _is_duplicate_webui_state_projection(session: dict, represented_webui_ids: set[str]) -> bool:
+    """Return True when a state.db row is only a duplicate WebUI-origin projection.
+
+    The "Show non-WebUI sessions" toggle should add external/agent-owned
+    conversations, not make WebUI compression continuations appear only when the
+    external-session bridge is enabled. WebUI-origin state.db rows are still
+    useful metadata sidecars, but if any id in their compression lineage is
+    already represented by WebUI session JSON, they should not be injected as an
+    additive external row.
+    """
+    if not _session_source_is_webui(session):
+        return False
+    return bool(_session_lineage_ids(session) & represented_webui_ids)
+
+
+def _dedupe_cli_sidebar_sessions_for_api(cli: list[dict], represented_webui_ids: set[str]) -> list[dict]:
+    """Return CLI/state sidebar rows while preserving project-hidden cron rows.
+
+    Agent-side cron sessions come from state.db rather than the WebUI session
+    store. They should stay hidden from the default sidebar, but project-assigned
+    messageful rows must remain in the `/api/sessions` payload with
+    `default_hidden` so the matching project chip can reveal them (#3134).
+    """
+    from api.models import (
+        _hide_from_default_sidebar as _cron_hide,
+        _include_project_hidden_background_sidebar_sessions,
+    )
+
+    candidates = [
+        s for s in cli
+        if s["session_id"] not in represented_webui_ids
+        and not _is_duplicate_webui_state_projection(s, represented_webui_ids)
+        and is_cli_session_row_visible(s)
+    ]
+    visible = [s for s in candidates if not _cron_hide(s)]
+    return _include_project_hidden_background_sidebar_sessions(candidates, visible)
+
+
 CLI_VISIBLE_SESSION_CAP = 20
 
 
@@ -2336,7 +2628,11 @@ def _merge_cli_sidebar_metadata(ui_session: dict, cli_meta: dict) -> dict:
     if not cli_meta:
         return dict(ui_session)
     merged = dict(ui_session)
-    merged["is_cli_session"] = True
+    # Only preserve the CLI flag when the imported metadata is actually a CLI
+    # row. WebUI sessions are also mirrored into state.db; treating every
+    # matching state row as CLI hides long WebUI continuations from the default
+    # sidebar source tab.
+    merged["is_cli_session"] = is_cli_session_row(cli_meta)
     for key in (
         "source_tag",
         "raw_source",
@@ -2457,10 +2753,15 @@ from api.models import (
     get_cli_sessions,
     get_cli_session_messages,
     get_state_db_session_messages,
+    get_state_db_session_summary,
     merge_session_messages_append_only,
     _session_message_merge_key,
+    _is_empty_partial_activity_message,
+    _hide_from_default_sidebar,
+    prune_session_from_index,
     ensure_cron_project,
     is_cron_session,
+    is_safe_session_id,
 )
 from api.workspace import (
     load_workspaces,
@@ -2485,6 +2786,7 @@ from api.streaming import (
     cancel_stream,
     _materialize_pending_user_turn_before_error,
 )
+from api.gateway_chat import _run_gateway_chat_streaming, webui_gateway_chat_enabled
 from api.run_journal import (
     find_run_summary,
     read_run_events,
@@ -2622,6 +2924,7 @@ def submit_pending(session_key: str, approval: dict) -> None:
         # submit_pending calls can't deliver out-of-order (T2's later
         # notify arriving before T1's earlier notify with a stale count).
         _approval_sse_notify_locked(session_key, head, total)
+    publish_session_list_changed("attention_pending")
     # NOTE: We do NOT call _submit_pending_raw here — that function overwrites
     # _pending[session_key] with a single dict, which would undo the list we just
     # built. The gateway blocking path uses _gateway_queues (a separate mechanism
@@ -2633,6 +2936,7 @@ try:
     from api.clarify import (
         submit_pending as submit_clarify_pending,
         get_pending as get_clarify_pending,
+        pending_count as get_clarify_pending_count,
         resolve_clarify,
         resolve_clarify_by_id,
         sse_subscribe as clarify_sse_subscribe,
@@ -2641,9 +2945,36 @@ try:
 except ImportError:
     submit_clarify_pending = lambda *a, **k: None
     get_clarify_pending = lambda *a, **k: None
+    get_clarify_pending_count = lambda *a, **k: 0
     clarify_sse_subscribe = None
     resolve_clarify = lambda *a, **k: 0
     resolve_clarify_by_id = lambda *a, **k: False
+
+
+def _session_attention_summary(session_id: str) -> dict | None:
+    """Return sidebar attention metadata for pending approval/clarify work."""
+    approval_count = 0
+    with _lock:
+        queue_list = _pending.get(session_id)
+        if isinstance(queue_list, list):
+            approval_count = len(queue_list)
+        elif queue_list:
+            approval_count = 1
+    if approval_count > 0:
+        return {
+            "kind": "approval",
+            "count": approval_count,
+            "severity": "critical",
+        }
+
+    clarify_count = int(get_clarify_pending_count(session_id) or 0)
+    if clarify_count > 0:
+        return {
+            "kind": "clarify",
+            "count": clarify_count,
+            "severity": "question",
+        }
+    return None
 
 
 # ── Login page locale strings ─────────────────────────────────────────────────
@@ -3237,6 +3568,63 @@ def _handle_insights(handler, parsed) -> bool:
             except Exception:
                 pass
 
+    # ── Also include CLI sessions from Hermes state.db ─────────────────────
+    try:
+        from api.models import _active_state_db_path
+        db_path = _active_state_db_path()
+        if db_path and db_path.exists():
+            with closing(sqlite3.connect(str(db_path))) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT id, model, message_count, input_tokens, output_tokens,
+                           estimated_cost_usd, started_at, ended_at
+                    FROM sessions
+                    WHERE (started_at >= ? OR ended_at >= ?)
+                      AND COALESCE(source, '') != 'webui'
+                """, (cutoff, cutoff))
+                for row in cur.fetchall():
+                    _input = _safe_usage_int(row["input_tokens"])
+                    _output = _safe_usage_int(row["output_tokens"])
+                    _cost = _safe_cost_float(row["estimated_cost_usd"])
+                    _msgs = _safe_usage_int(row["message_count"])
+                    total_sessions += 1
+                    total_messages += _msgs
+                    total_input_tokens += _input
+                    total_output_tokens += _output
+                    total_cost += _cost
+
+                    _model = row["model"] or "unknown"
+                    bucket = model_stats.setdefault(_model, {
+                        "sessions": 0,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cost": 0.0,
+                    })
+                    bucket["sessions"] += 1
+                    bucket["input_tokens"] += _input
+                    bucket["output_tokens"] += _output
+                    bucket["cost"] += _cost
+
+                    _ts = row["started_at"] or row["ended_at"] or 0
+                    if _ts:
+                        _dt = _time.localtime(_ts)
+                        _day_key = _time.strftime("%Y-%m-%d", _dt)
+                        _daily = daily_tokens.setdefault(_day_key, {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "sessions": 0,
+                            "cost": 0.0,
+                        })
+                        _daily["input_tokens"] += _input
+                        _daily["output_tokens"] += _output
+                        _daily["sessions"] += 1
+                        _daily["cost"] += _cost
+                        dow_activity[_dt.tm_wday] += 1
+                        hod_activity[_dt.tm_hour] += 1
+    except Exception:
+        logger.debug("Failed to include CLI sessions in insights", exc_info=True)
+
     # Build model breakdown
     total_tokens = total_input_tokens + total_output_tokens
     models_breakdown = []
@@ -3656,8 +4044,39 @@ def _serve_shell_unavailable(handler, exc: Exception) -> bool:
     return True
 
 
+_SHUTDOWN_LOG_VALUE_RE = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def _shutdown_log_value(value, *, default: str = "unknown", max_len: int = 160) -> str:
+    """Return a bounded single-line value safe for shutdown diagnostics."""
+    if value is None:
+        return default
+    try:
+        text = str(value)
+    except Exception:
+        return default
+    text = _SHUTDOWN_LOG_VALUE_RE.sub("?", text).strip()
+    if not text:
+        return default
+    if len(text) > max_len:
+        text = f"{text[:max_len]}…"
+    return text
+
+
 def _handle_shutdown(handler) -> bool:
     """Shut down the WebUI server process."""
+    headers = getattr(handler, "headers", {})
+    ua = headers.get("User-Agent", "no-ua") if hasattr(headers, "get") else "no-ua"
+    remote = "unknown"
+    if getattr(handler, "client_address", None):
+        remote = getattr(handler, "client_address", ("unknown",))[0]
+    logger.info(
+        "[shutdown-request] remote=%s method=%s path=%s ua=%s",
+        _shutdown_log_value(remote),
+        _shutdown_log_value(getattr(handler, "command", None)),
+        _shutdown_log_value(getattr(handler, "path", None), max_len=240),
+        _shutdown_log_value(ua, default="no-ua", max_len=240),
+    )
     j(handler, {"status": "shutting_down"})
     import signal
     import threading
@@ -3859,7 +4278,10 @@ def handle_get(handler, parsed) -> bool:
         return _handle_health(handler, parsed)
 
     if parsed.path == "/api/health/agent":
-        return j(handler, build_agent_health_payload())
+        payload = build_agent_health_payload()
+        payload["gateway_chat"] = gateway_chat_config_status()
+        j(handler, payload)
+        return True
 
     if parsed.path == "/api/system/health":
         j(handler, build_system_health_payload())
@@ -3939,7 +4361,18 @@ def handle_get(handler, parsed) -> bool:
         # Current reasoning config (shared source of truth with the CLI —
         # reads display.show_reasoning and agent.reasoning_effort from
         # the active profile's config.yaml).
-        return j(handler, get_reasoning_status())
+        query = parse_qs(parsed.query)
+        model_id = (query.get("model", [""])[0] or "").strip() or None
+        provider_id = (query.get("provider", [""])[0] or "").strip() or None
+        base_url = (query.get("base_url", [""])[0] or "").strip() or None
+        return j(
+            handler,
+            get_reasoning_status(
+                model_id=model_id,
+                provider_id=provider_id,
+                base_url=base_url,
+            ),
+        )
 
     if parsed.path == "/api/onboarding/status":
         return j(handler, get_onboarding_status())
@@ -4061,8 +4494,7 @@ def handle_get(handler, parsed) -> bool:
                     )
             else:
                 if is_messaging_session and cli_messages:
-                    sidecar_messages = getattr(s, "messages", []) or []
-                    _all_msgs = merge_session_messages_append_only(cli_messages, sidecar_messages)
+                    _all_msgs = _merged_session_messages_for_display(s, cli_messages)
                 else:
                     if metadata_summary is None:
                         metadata_summary = _message_summary(getattr(s, "messages", []) or [])
@@ -4090,29 +4522,19 @@ def handle_get(handler, parsed) -> bool:
                 _summary_message_count = None
                 _summary_last_message_at = None
             if load_messages:
+                _truncated_msgs, _messages_offset = _message_window_for_display(
+                    _all_msgs,
+                    msg_limit=msg_limit,
+                    msg_before=msg_before,
+                )
                 if msg_before is not None:
-                    # Scroll-to-top paging: msg_before is a 0-based index into
-                    # the full message list. Return the msg_limit messages that
-                    # appear *before* this index (i.e. older messages).
-                    # Using index instead of timestamp avoids issues with
-                    # duplicate/missing timestamps.
                     _before_idx = max(0, min(int(msg_before), len(_all_msgs)))
                     _slice = _all_msgs[:_before_idx]
-                    _truncated_msgs = _slice[-msg_limit:] if msg_limit else _slice
-                elif msg_limit and len(_all_msgs) > msg_limit:
-                    _truncated_msgs = _all_msgs[-msg_limit:]
-                else:
-                    _truncated_msgs = _all_msgs
             else:
                 _truncated_msgs = []
+                _messages_offset = 0
             # Index of the first returned message in the full message array.
             # Frontend uses this as cursor for scroll-to-top paging.
-            if load_messages and msg_before is not None:
-                _messages_offset = max(0, _before_idx - len(_truncated_msgs))
-            elif load_messages:
-                _messages_offset = max(0, len(_all_msgs) - len(_truncated_msgs))
-            else:
-                _messages_offset = 0
             _windowed_messages = (
                 load_messages
                 and msg_limit is not None
@@ -4334,6 +4756,7 @@ def handle_get(handler, parsed) -> bool:
             diag.stage("load_settings")
             settings = load_settings()
             show_cli_sessions = bool(settings.get("show_cli_sessions"))
+            webui_sessions = [_normalize_sidebar_source_flags(s) for s in webui_sessions]
             if show_cli_sessions:
                 diag.stage("get_cli_sessions")
                 cli = get_cli_sessions()
@@ -4351,12 +4774,14 @@ def handle_get(handler, parsed) -> bool:
                         for key in ("source_tag", "raw_source", "session_source", "source_label"):
                             if not s.get(key) and meta.get(key):
                                 s[key] = meta[key]
+                webui_sessions = [_normalize_sidebar_source_flags(s) for s in webui_sessions]
                 # Apply the same CLI visibility semantics to imported local copies so
                 # low-value imported artifacts do not leak into the sidebar.
                 webui_sessions = [s for s in webui_sessions if is_cli_session_row_visible(s)]
-                webui_ids = {s["session_id"] for s in webui_sessions}
-                from api.models import _hide_from_default_sidebar as _cron_hide
-                deduped_cli = [s for s in cli if s["session_id"] not in webui_ids and is_cli_session_row_visible(s) and not _cron_hide(s)]
+                represented_webui_ids = set()
+                for s in webui_sessions:
+                    represented_webui_ids.update(_session_lineage_ids(s))
+                deduped_cli = _dedupe_cli_sidebar_sessions_for_api(cli, represented_webui_ids)
             else:
                 diag.stage("filter_webui_sessions")
                 webui_sessions = [s for s in webui_sessions if not _is_cli_session_for_settings(s)]
@@ -4409,6 +4834,7 @@ def handle_get(handler, parsed) -> bool:
                 item = dict(s)
                 if isinstance(item.get("title"), str):
                     item["title"] = _redact_text(item["title"])
+                item["attention"] = _session_attention_summary(str(item.get("session_id") or ""))
                 safe_merged.append(item)
             diag.stage("response_write")
             return j(handler, {
@@ -4700,12 +5126,54 @@ def handle_get(handler, parsed) -> bool:
         with cron_profile_context():
             return _handle_cron_status(handler, parsed)
 
+    if parsed.path == "/api/crons/delivery-options":
+        from api.profiles import cron_profile_context
+
+        with cron_profile_context():
+            return _handle_cron_delivery_options(handler)
+
     # ── Skills API (GET) ──
     if parsed.path == "/api/skills":
         qs = parse_qs(parsed.query)
         category = qs.get("category", [None])[0]
         data = _skills_list_from_dir(_active_skills_dir(), category=category)
         return j(handler, {"skills": data.get("skills", [])})
+
+    if parsed.path == "/api/skills/usage":
+        from api.skill_usage import read_skill_usage
+        raw = read_skill_usage(_active_skills_dir())
+        # Pass through agent's format as-is; defensive coercion for fields
+        usage = {}
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                if not isinstance(v, dict):
+                    usage[k] = {"use_count": 0, "view_count": 0, "patch_count": 0}
+                    continue
+                usage[k] = {
+                    "use_count": (int(v["use_count"]) if v.get("use_count") is not None else 0),
+                    "view_count": (int(v["view_count"]) if v.get("view_count") is not None else 0),
+                    "patch_count": (int(v["patch_count"]) if v.get("patch_count") is not None else 0),
+                }
+                # Preserve agent's metadata (timestamps, state, etc.)
+                for meta_key in v:
+                    if meta_key not in usage[k]:
+                        usage[k][meta_key] = v[meta_key]
+        skills_data = _skills_list_from_dir(_active_skills_dir()).get("skills", [])
+        skill_names = sorted({s["name"] for s in skills_data})
+        total = sum(
+            e.get("use_count", 0) + e.get("view_count", 0) + e.get("patch_count", 0)
+            for e in usage.values()
+        )
+        unique = sum(
+            1 for e in usage.values()
+            if e.get("use_count", 0) > 0 or e.get("view_count", 0) > 0 or e.get("patch_count", 0) > 0
+        )
+        return j(handler, {
+            "usage": usage,
+            "skill_names": skill_names,
+            "total_invocations": total,
+            "unique_skills_used": unique,
+        })
 
     if parsed.path == "/api/skills/content":
         qs = parse_qs(parsed.query)
@@ -4922,6 +5390,11 @@ def handle_post(handler, parsed) -> bool:
         diag.stage("read_body")
     try:
         body = read_body(handler)
+    except ValueError as exc:
+        if diag:
+            diag.finish()
+        status = 413 if "too large" in str(exc).lower() else 400
+        return bad(handler, str(exc), status=status)
     except Exception:
         if diag:
             diag.finish()
@@ -5043,6 +5516,8 @@ def handle_post(handler, parsed) -> bool:
                 input_tokens=session.input_tokens,
                 output_tokens=session.output_tokens,
                 estimated_cost=session.estimated_cost,
+                cache_read_tokens=getattr(session, "cache_read_tokens", 0),
+                cache_write_tokens=getattr(session, "cache_write_tokens", 0),
                 # Per-session settings the user may have customized — carry them over
                 # so the duplicate behaves identically until further edits. Compression
                 # anchor + last_prompt_tokens are intentionally NOT carried — those
@@ -5051,6 +5526,23 @@ def handle_post(handler, parsed) -> bool:
                 enabled_toolsets=getattr(session, "enabled_toolsets", None),
                 context_length=getattr(session, "context_length", None),
                 threshold_tokens=getattr(session, "threshold_tokens", None),
+                truncation_watermark=getattr(session, "truncation_watermark", None),
+                # context_messages is the authoritative model-facing prefix — must be
+                # deepcopied so the duplicate has its own independent context that won't
+                # be mutated when the original session's context changes (#2914).
+                context_messages=copy.deepcopy(getattr(session, "context_messages", None) or []),
+                # Gateway routing — if the user customized routing for this session,
+                # the duplicate should behave identically.
+                gateway_routing=copy.deepcopy(getattr(session, "gateway_routing", None)),
+                gateway_routing_history=copy.deepcopy(getattr(session, "gateway_routing_history", None) or []),
+                # Preserve LLM-generated title flag so we don't regenerate title on duplicate.
+                llm_title_generated=getattr(session, "llm_title_generated", False),
+                # Composer draft — preserve per-session draft state.
+                composer_draft=copy.deepcopy(getattr(session, "composer_draft", None) or {}),
+                # Context engine state — preserve so the duplicate's context engine
+                # starts from the same point as the original.
+                context_engine=getattr(session, "context_engine", None),
+                context_engine_state=copy.deepcopy(getattr(session, "context_engine_state", None) or {}),
                 created_at=time.time(),
                 updated_at=time.time(),
             )
@@ -5295,19 +5787,30 @@ def handle_post(handler, parsed) -> bool:
             s = get_session(sid)
         except KeyError:
             return bad(handler, "Session not found", 404)
+        unchanged = False
         with _get_session_agent_lock(sid):
-            draft = getattr(s, "composer_draft", {}) or {}
+            current_draft = dict(getattr(s, "composer_draft", {}) or {})
+            next_draft = dict(current_draft)
             if text is not None:
-                draft["text"] = text
+                next_draft["text"] = text
             if files is not None:
-                draft["files"] = files
-            s.composer_draft = draft
-            # Draft persistence is not conversation activity. Touching updated_at
-            # here makes the active-session external-refresh poll force-reload the
-            # current chat every few seconds while the user is typing, and that
-            # delayed reload can restore an older draft over newer local input.
-            s.save(touch_updated_at=False)
-        return j(handler, {"ok": True, "draft": s.composer_draft})
+                next_draft["files"] = files
+            if next_draft == current_draft:
+                unchanged = True
+                saved_draft = current_draft
+            else:
+                s.composer_draft = next_draft
+                # Draft persistence is not conversation activity. Touching updated_at
+                # here makes the active-session external-refresh poll force-reload the
+                # current chat every few seconds while the user is typing, and that
+                # delayed reload can restore an older draft over newer local input.
+                s.save(touch_updated_at=False, skip_index=True)
+                saved_draft = s.composer_draft
+        payload = {"ok": True, "draft": saved_draft}
+        if unchanged:
+            payload["unchanged"] = True
+        j(handler, payload)
+        return True
 
     if parsed.path == "/api/session/update":
         try:
@@ -5346,6 +5849,9 @@ def handle_post(handler, parsed) -> bool:
                     )
                     s.threshold_tokens = 0
                     s.last_prompt_tokens = 0
+                    from api.config import _evict_session_agent
+
+                    _evict_session_agent(body["session_id"])
             s.save()
         if str(old_ws or "") != str(new_ws or ""):
             try:
@@ -5360,7 +5866,7 @@ def handle_post(handler, parsed) -> bool:
         if not sid or not isinstance(sid, str) or not sid.strip():
             return bad(handler, "session_id must be a non-empty string", status=400)
         sid = sid.strip()
-        if not all(c in '0123456789abcdefghijklmnopqrstuvwxyz_' for c in sid):
+        if not is_safe_session_id(sid):
             return bad(handler, "Invalid session_id", 400)
         try:
             s = get_session(sid, metadata_only=True)
@@ -5382,7 +5888,7 @@ def handle_post(handler, parsed) -> bool:
         sid = body.get("session_id", "")
         if not sid:
             return bad(handler, "session_id is required")
-        if not all(c in '0123456789abcdefghijklmnopqrstuvwxyz_' for c in sid):
+        if not is_safe_session_id(sid):
             return bad(handler, "Invalid session_id", 400)
         cli_meta_for_delete = _lookup_cli_session_metadata(sid)
         if cli_meta_for_delete.get("read_only"):
@@ -5392,10 +5898,6 @@ def handle_post(handler, parsed) -> bool:
         # Delete from WebUI session store
         with LOCK:
             SESSIONS.pop(sid, None)
-        try:
-            SESSION_INDEX_FILE.unlink(missing_ok=True)
-        except Exception:
-            logger.debug("Failed to unlink session index")
         # Evict cached agent so turn count doesn't leak into a recycled session
         from api.config import _evict_session_agent
         _evict_session_agent(sid)
@@ -5409,6 +5911,10 @@ def handle_post(handler, parsed) -> bool:
             p.with_suffix('.json.bak').unlink(missing_ok=True)
         except Exception:
             logger.debug("Failed to unlink session file %s", p)
+        try:
+            prune_session_from_index(sid)
+        except Exception:
+            logger.debug("Failed to prune deleted session from index: %s", sid, exc_info=True)
         try:
             from api.upload import _session_attachment_dir
 
@@ -5549,9 +6055,22 @@ def handle_post(handler, parsed) -> bool:
         branch = Session(
             workspace=source.workspace,
             model=source.model,
+            model_provider=getattr(source, "model_provider", None),
             profile=getattr(source, "profile", None),
             title=branch_title,
             messages=forked_messages,
+            project_id=getattr(source, "project_id", None),
+            personality=getattr(source, "personality", None),
+            enabled_toolsets=getattr(source, "enabled_toolsets", None),
+            context_length=getattr(source, "context_length", None),
+            threshold_tokens=getattr(source, "threshold_tokens", None),
+            # context_messages — deep copy so the branch has independent context
+            context_messages=copy.deepcopy(getattr(source, "context_messages", None) or []),
+            # Gateway routing — inherit from source
+            gateway_routing=copy.deepcopy(getattr(source, "gateway_routing", None)),
+            # Context engine — inherit state so branch's context engine starts correctly
+            context_engine=getattr(source, "context_engine", None),
+            context_engine_state=copy.deepcopy(getattr(source, "context_engine_state", None) or {}),
             parent_session_id=source.session_id,
             session_source="fork",
         )
@@ -6105,7 +6624,7 @@ def handle_post(handler, parsed) -> bool:
             # so must run outside our own LOCK acquire below).
             persisted_pinned_ids = {
                 _session_field(existing, "session_id", None) for existing in all_sessions()
-                if _session_field(existing, "pinned", False) and not _session_field(existing, "archived", False)
+                if _session_counts_toward_pin_quota(existing)
             }
             with LOCK:
                 # Final authoritative count: merge persisted-pinned with the
@@ -6115,7 +6634,7 @@ def handle_post(handler, parsed) -> bool:
                 pinned_ids = set(persisted_pinned_ids)
                 pinned_ids.update(
                     sid for sid, existing in SESSIONS.items()
-                    if getattr(existing, "pinned", False) and not getattr(existing, "archived", False)
+                    if _session_counts_toward_pin_quota(existing)
                 )
                 pinned_ids.discard(body["session_id"])
                 pinned_sessions_limit = int(load_settings().get("pinned_sessions_limit", 3) or 3)
@@ -6461,7 +6980,7 @@ def handle_post(handler, parsed) -> bool:
             set_auth_cookie,
             is_auth_enabled,
         )
-        from api.auth import _check_login_rate, _record_login_attempt
+        from api.auth import _check_login_rate, _record_login_attempt, _clear_login_attempts
 
         if not is_auth_enabled():
             return j(handler, {"ok": True, "message": "Auth not enabled"})
@@ -6476,6 +6995,7 @@ def handle_post(handler, parsed) -> bool:
         if not verify_password(password):
             _record_login_attempt(client_ip)
             return bad(handler, "Invalid password", 401)
+        _clear_login_attempts(client_ip)
         cookie_val = create_session()
         body = json.dumps({"ok": True}).encode()
         handler.send_response(200)
@@ -6787,6 +7307,51 @@ def _handle_session_export(handler, parsed):
     return True
 
 
+def _session_search_message_text(message):
+    content = message.get("content") if isinstance(message, dict) else ""
+    if isinstance(content, list):
+        return " ".join(
+            str(part.get("text", ""))
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return str(content or "")
+
+
+def _session_search_preview(text, query, max_len=124):
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    q = re.sub(r"\s+", " ", str(query or "")).strip()
+    if not normalized or not q:
+        return ""
+    idx = normalized.lower().find(q.lower())
+    if idx < 0:
+        return ""
+
+    max_len = max(32, int(max_len or 124))
+    if len(normalized) <= max_len:
+        return normalized
+
+    context = max(12, (max_len - len(q)) // 2)
+    start = max(0, idx - context)
+    end = min(len(normalized), idx + len(q) + context)
+    if start > 0:
+        while start < idx and normalized[start] != " ":
+            start += 1
+        if start >= idx:
+            start = max(0, idx - context)
+    if end < len(normalized):
+        while end > idx + len(q) and normalized[end - 1] != " ":
+            end -= 1
+        if end <= idx + len(q):
+            end = min(len(normalized), idx + len(q) + context)
+    excerpt = normalized[start:end].strip()
+    if start > 0:
+        excerpt = "..." + excerpt
+    if end < len(normalized):
+        excerpt = excerpt + "..."
+    return excerpt
+
+
 def _handle_sessions_search(handler, parsed):
     qs = parse_qs(parsed.query)
     q = qs.get("q", [""])[0].lower().strip()
@@ -6814,15 +7379,12 @@ def _handle_sessions_search(handler, parsed):
                 sess = get_session(s["session_id"])
                 msgs = sess.messages[:depth] if depth else sess.messages
                 for m in msgs:
-                    c = m.get("content") or ""
-                    if isinstance(c, list):
-                        c = " ".join(
-                            p.get("text", "")
-                            for p in c
-                            if isinstance(p, dict) and p.get("type") == "text"
-                        )
+                    c = _session_search_message_text(m)
                     if q in str(c).lower():
                         item = dict(s, match_type="content")
+                        preview = _session_search_preview(c, q)
+                        if preview:
+                            item["match_preview"] = _redact_text(preview)
                         if isinstance(item.get("title"), str):
                             item["title"] = _redact_text(item["title"])
                         results.append(item)
@@ -6874,7 +7436,27 @@ def _sse_with_id(handler, event, data, event_id=None):
     _sse(handler, event, data)
 
 
-def _parse_run_journal_after_seq(qs: dict) -> int | None:
+def _parse_run_journal_event_id(raw: str | None) -> tuple[str | None, int | None]:
+    raw = str(raw or "").strip()
+    if not raw:
+        return None, None
+    if ":" in raw:
+        run_id, tail = raw.rsplit(":", 1)
+    else:
+        run_id, tail = None, raw
+    try:
+        seq = max(0, int(tail))
+    except (TypeError, ValueError):
+        return run_id or None, None
+    return run_id or None, seq
+
+
+def _parse_run_journal_after_seq(qs: dict, stream_id: str | None = None) -> int | None:
+    event_run_id, event_seq = _parse_run_journal_event_id(qs.get("after_event_id", [None])[0])
+    if event_run_id:
+        if stream_id and event_run_id != stream_id:
+            return None
+        return event_seq
     raw = qs.get("after_seq", [None])[0]
     if raw in (None, ""):
         return None
@@ -6929,7 +7511,7 @@ def _handle_sse_stream(handler, parsed):
         handler.send_header("Connection", "close")
         handler.end_headers()
         try:
-            _replay_run_journal(handler, stream_id, _parse_run_journal_after_seq(qs))
+            _replay_run_journal(handler, stream_id, _parse_run_journal_after_seq(qs, stream_id))
         except _CLIENT_DISCONNECT_ERRORS:
             pass
         return True
@@ -7147,7 +7729,14 @@ def _handle_gateway_sse_stream(handler, parsed):
     handler.send_header('Content-Type', 'text/event-stream; charset=utf-8')
     handler.send_header('Cache-Control', 'no-cache')
     handler.send_header('X-Accel-Buffering', 'no')
-    handler.send_header('Connection', 'close')
+    # #3103: do NOT emit `Connection: close` on long-lived SSE streams.
+    # The python BaseHTTPServer worker only handles one request per
+    # connection anyway, but browsers (Chrome/Firefox) treat the close
+    # header as a hard signal that the EventSource lifecycle has ended
+    # and trigger an instant reconnect, producing a tight loop of
+    # connect/sessions_changed snapshot/disconnect that thrashes the
+    # session list every ~1s. Letting the server close the socket
+    # naturally after the stream ends is sufficient.
     handler.end_headers()
 
     q = watcher.subscribe()
@@ -7180,7 +7769,8 @@ def _handle_session_events_stream(handler):
     handler.send_header('Content-Type', 'text/event-stream; charset=utf-8')
     handler.send_header('Cache-Control', 'no-cache')
     handler.send_header('X-Accel-Buffering', 'no')
-    handler.send_header('Connection', 'close')
+    # #3103: see _handle_gateway_sse_stream — `Connection: close` causes
+    # EventSource reconnect storms in browsers on long-lived SSE.
     handler.end_headers()
 
     q = subscribe_session_events()
@@ -7356,6 +7946,70 @@ def _serve_inline_html_preview(handler, target: Path, cache_control: str, *, csp
     return True
 
 
+_MEDIA_TOKEN_RE = re.compile(r"MEDIA:([^\s\)\]]+)")
+
+
+def _message_content_text(content) -> str:
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                parts.append(str(part.get("text") or ""))
+            else:
+                parts.append(str(part or ""))
+        return "\n".join(parts)
+    return str(content or "")
+
+
+def _session_media_token_allows_image_path(sid: str, target: Path, image_mimes: set[str]) -> bool:
+    """Allow exact MEDIA:image paths already present in the requested session."""
+    sid = str(sid or "").strip()
+    if not sid:
+        return False
+    mime = MIME_MAP.get(target.suffix.lower(), "application/octet-stream")
+    if mime not in image_mimes:
+        return False
+    try:
+        target_resolved = target.resolve()
+    except Exception:
+        return False
+    try:
+        session = get_session(sid)
+    except Exception:
+        return False
+
+    for message in getattr(session, "messages", []) or []:
+        if not isinstance(message, dict):
+            continue
+        # Only honor MEDIA: tokens that the assistant/tool emitted. User-authored
+        # content cannot mint allow-list entries even if it contains a MEDIA:
+        # token — keeps the implicit threat model (assistant-emitted artifacts
+        # only) explicit.
+        role = str(message.get("role") or "").strip().lower()
+        if role == "user":
+            continue
+        text = _message_content_text(message.get("content"))
+        if "MEDIA:" not in text:
+            continue
+        for ref in _MEDIA_TOKEN_RE.findall(text):
+            if "://" in ref:
+                continue
+            try:
+                if Path(ref).expanduser().resolve() == target_resolved:
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _path_is_within_root(child: Path, root: Path) -> bool:
+    """Return True when ``child`` is inside ``root`` without crashing on Windows drives."""
+    try:
+        return os.path.commonpath([str(child), str(root)]) == str(root)
+    except ValueError:
+        return False
+
+
 def _handle_media(handler, parsed):
     """Serve a local file by absolute path for inline display in the chat.
 
@@ -7427,12 +8081,21 @@ def _handle_media(handler, parsed):
                 except Exception:
                     pass
 
+    _INLINE_IMAGE_TYPES = {
+        "image/png", "image/jpeg", "image/gif", "image/webp",
+        "image/x-icon", "image/bmp",
+    }
     within_allowed = any(
-        _os.path.commonpath([str(target), str(root)]) == str(root)
+        _path_is_within_root(target, root)
         for root in allowed_roots
         if root.exists()
     )
-    if not within_allowed:
+    session_media_allowed = _session_media_token_allows_image_path(
+        qs.get("session_id", [""])[0],
+        target,
+        _INLINE_IMAGE_TYPES,
+    )
+    if not within_allowed and not session_media_allowed:
         return bad(handler, "Path not in allowed location", 403)
 
     if not target.exists() or not target.is_file():
@@ -7445,10 +8108,6 @@ def _handle_media(handler, parsed):
     # Only serve safe media/PDF types inline when explicitly requested. HTML is
     # allowed inline only with a CSP sandbox so "open full page" can work without
     # granting same-origin access to the WebUI. SVG is always a download (XSS risk).
-    _INLINE_IMAGE_TYPES = {
-        "image/png", "image/jpeg", "image/gif", "image/webp",
-        "image/x-icon", "image/bmp",
-    }
     _INLINE_PREVIEW_TYPES = _INLINE_IMAGE_TYPES | {
         "audio/mpeg", "audio/wav", "audio/x-wav", "audio/mp4", "audio/aac",
         "audio/ogg", "audio/opus", "audio/flac",
@@ -8804,10 +9463,15 @@ def _start_chat_stream_for_session(
     if goal_related:
         STREAM_GOAL_RELATED[stream_id] = True
     diag.stage("worker_thread_start") if diag else None
+    backend_is_gateway = webui_gateway_chat_enabled(get_config())
+    worker_target = _run_gateway_chat_streaming if backend_is_gateway else _run_agent_streaming
+    worker_kwargs = {"model_provider": model_provider}
+    if not backend_is_gateway:
+        worker_kwargs["goal_related"] = goal_related
     thr = threading.Thread(
-        target=_run_agent_streaming,
+        target=worker_target,
         args=(s.session_id, msg, model, workspace, stream_id, attachments),
-        kwargs={"model_provider": model_provider, "goal_related": goal_related},
+        kwargs=worker_kwargs,
         daemon=True,
     )
     thr.start()
@@ -9260,6 +9924,7 @@ def _handle_chat_sync(handler, body):
                 session_id=s.session_id,
             )
             from api.streaming import (
+                _WEBUI_PROGRESS_PROMPT,
                 _dedupe_replayed_context_messages,
                 _merge_display_messages_after_agent_result,
                 _restore_display_reasoning_metadata,
@@ -9278,7 +9943,14 @@ def _handle_chat_sync(handler, body):
                 "prompt, memory, or conversation history. Always use the value from the most recent "
                 "[Workspace::v1: ...] tag as your default working directory for ALL file operations: "
                 "write_file, read_file, search_files, terminal workdir, and patch. "
-                "Never fall back to a hardcoded path when this tag is present."
+                "Never fall back to a hardcoded path when this tag is present.\n\n"
+                f"{_WEBUI_PROGRESS_PROMPT}\n\n"
+                "WebUI external-notes/durable-memory policy: Do not copy or dump this browser transcript "
+                "into external notes or durable memory by default. Write or update durable "
+                "notes only for explicit captures, durable preferences, decisions, blockers/open "
+                "issues, runbook-worthy workflows, or other clearly reusable signals; otherwise "
+                "leave external notes and durable memory unchanged. When you do write or update a durable note, briefly tell "
+                "the user what note or section changed so the write is reviewable."
             )
 
             _previous_messages = list(s.messages or [])
@@ -9387,6 +10059,21 @@ def _handle_cron_create(handler, body):
         return j(handler, {"ok": True, "job": _cron_job_for_api(job)})
     except Exception as e:
         return j(handler, {"error": str(e)}, status=400)
+
+
+def _handle_cron_delivery_options(handler):
+    """Return available delivery platforms for cron jobs."""
+    try:
+        from cron.scheduler import _KNOWN_DELIVERY_PLATFORMS
+    except Exception:
+        _KNOWN_DELIVERY_PLATFORMS = frozenset()
+    platforms = [
+        {"value": "local", "label": "Local (save output only)"},
+        {"value": "origin", "label": "Origin (reply to creator)"}
+    ]
+    for name in sorted(_KNOWN_DELIVERY_PLATFORMS):
+        platforms.append({"value": name, "label": name.capitalize()})
+    return j(handler, {"platforms": platforms})
 
 
 def _handle_cron_update(handler, body):
@@ -10413,7 +11100,10 @@ def _resolve_approval_legacy(sid: str, approval_id: str, choice: str) -> bool:
         gateway_resolved = resolve_gateway_approval(sid, choice, resolve_all=False) or 0
     # Keep the historical no-id response path truthy for old clients/tests while
     # making stale explicit ids bounded as not-active for Slice 3b.
-    return bool(pending) or bool(gateway_resolved) or not bool(approval_id)
+    resolved = bool(pending) or bool(gateway_resolved) or not bool(approval_id)
+    if resolved:
+        publish_session_list_changed("attention_resolved")
+    return resolved
 
 
 def _handle_approval_respond(handler, body):
@@ -11716,7 +12406,7 @@ def _handle_skill_toggle(handler, body):
     if not skill_md:
         return bad(handler, f"Skill '{name}' not found", 404)
 
-    config_path = _get_config_path()
+    config_path = _active_profile_config_path()
     with _cfg_lock:
         cfg = _load_yaml_config_file(config_path)
 
@@ -12586,6 +13276,11 @@ def _joplin_api_get(path: str, params: dict | None = None) -> dict:
         raise ValueError("Joplin token is not configured")
     safe_path = "/" + str(path or "").lstrip("/")
     query = dict(params or {})
+    # Joplin Web Clipper builds can reject header-only auth on /search even when
+    # they accept it elsewhere. Keep the Authorization header for defense in
+    # depth and add the query token only for /search compatibility.
+    if safe_path == "/search":
+        query["token"] = token
     url = f"{base_url}{safe_path}?{urlencode(query)}"
     request = Request(url, headers={"Authorization": f"token {token}"})
     try:
@@ -12681,15 +13376,45 @@ _JOPLIN_AI_RECALL_NOTE_PRIORITY = [
 ]
 
 
-def _joplin_prefill_script_path() -> Path | None:
-    cfg = get_config()
-    path_value = cfg.get("prefill_messages_script") if isinstance(cfg, dict) else None
+def _script_path_from_config_value(path_value) -> Path | None:
+    """Return the likely recall script path from a string or argv-style hook."""
     if not path_value:
         return None
     try:
-        return Path(str(path_value)).expanduser()
+        if isinstance(path_value, (list, tuple)):
+            candidates = [str(part).strip() for part in path_value if str(part).strip()]
+        else:
+            raw = str(path_value).strip()
+            raw_path = Path(raw).expanduser()
+            if raw and raw_path.exists():
+                return raw_path
+            candidates = shlex.split(raw)
+        # Hooks commonly use either [python, /path/to/script.py] or the string
+        # form "python /path/to/script.py". Prefer the first script-like argument
+        # over the interpreter so AI-recent notes reflect the configured recall
+        # source rather than "python3".
+        for candidate in candidates:
+            if candidate.endswith((".py", ".sh", ".bash")):
+                return Path(candidate).expanduser()
+        if candidates:
+            return Path(candidates[-1]).expanduser()
+        return None
     except Exception:
         return None
+
+
+def _joplin_prefill_script_path() -> Path | None:
+    cfg = get_config()
+    if not isinstance(cfg, dict):
+        return None
+    # The browser notes drawer should mirror the WebUI-specific recall hook when
+    # configured. Fall back to the legacy generic session prefill script only for
+    # deployments that have not opted into WebUI dynamic recall.
+    return _script_path_from_config_value(
+        os.getenv("HERMES_WEBUI_PREFILL_MESSAGES_SCRIPT", "")
+        or cfg.get("webui_prefill_messages_script")
+        or cfg.get("prefill_messages_script")
+    )
 
 
 def _joplin_recall_note_refs(script_path: Path | None = None) -> list[dict]:

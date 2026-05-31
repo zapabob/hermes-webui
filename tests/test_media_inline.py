@@ -16,6 +16,8 @@ import os
 import pathlib
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 import urllib.error
 import urllib.request
 
@@ -50,6 +52,10 @@ class TestMediaRenderMdStash(unittest.TestCase):
     def test_media_api_url_pattern(self):
         self.assertIn("api/media?path=", UI_JS,
                       "renderMd must build api/media?path=... URL for local files")
+
+    def test_local_media_api_url_carries_session_id_when_available(self):
+        self.assertIn("session_id='+encodeURIComponent(mediaSessionId)", UI_JS,
+                      "local MEDIA: image URLs must include session_id so the server can authorize session-referenced artifacts")
 
     def test_local_audio_video_media_tokens_request_inline_streaming(self):
         self.assertIn("apiUrl+'&inline=1'", UI_JS,
@@ -249,11 +255,79 @@ class TestMediaEndpointUnit(unittest.TestCase):
         self.assertIn(".split(_os.pathsep)", block)
         self.assertNotIn('.split(":")', block)
 
+    def test_path_is_within_root_treats_commonpath_valueerror_as_not_within(self):
+        """Windows cross-drive commonpath() errors must not crash /api/media."""
+        from api import routes
+
+        with mock.patch.object(
+            routes.os.path,
+            "commonpath",
+            side_effect=ValueError("Paths don't have the same drive"),
+        ):
+            self.assertFalse(
+                routes._path_is_within_root(
+                    pathlib.Path("D:/outputs/card.png"),
+                    pathlib.Path("C:/Users/agent/.hermes"),
+                )
+            )
+
+    def test_path_is_within_root_accepts_child_path(self):
+        from api import routes
+
+        with tempfile.TemporaryDirectory() as tmpd:
+            root = pathlib.Path(tmpd).resolve()
+            child = root / "media" / "card.png"
+            child.parent.mkdir()
+            child.write_bytes(b"png")
+            self.assertTrue(routes._path_is_within_root(child.resolve(), root))
+
     def test_media_endpoints_advertise_byte_range_support(self):
         routes_src = (REPO_ROOT / "api" / "routes.py").read_text(encoding="utf-8")
         self.assertIn("Accept-Ranges", routes_src)
         self.assertIn("Content-Range", routes_src)
         self.assertIn("206", routes_src)
+
+    def test_session_media_token_allows_exact_image_path(self):
+        from api import routes
+
+        with tempfile.TemporaryDirectory() as tmpd:
+            image = pathlib.Path(tmpd) / "card.png"
+            image.write_bytes(b"\x89PNG\r\n\x1a\n")
+            session = SimpleNamespace(messages=[{"role": "assistant", "content": f"MEDIA:{image}"}])
+            with mock.patch.object(routes, "get_session", return_value=session):
+                self.assertTrue(
+                    routes._session_media_token_allows_image_path(
+                        "s-media", image, {"image/png"}
+                    )
+                )
+
+    def test_session_media_token_rejects_unmentioned_image_path(self):
+        from api import routes
+
+        with tempfile.TemporaryDirectory() as tmpd:
+            image = pathlib.Path(tmpd) / "card.png"
+            image.write_bytes(b"\x89PNG\r\n\x1a\n")
+            session = SimpleNamespace(messages=[{"role": "assistant", "content": "MEDIA:/tmp/other.png"}])
+            with mock.patch.object(routes, "get_session", return_value=session):
+                self.assertFalse(
+                    routes._session_media_token_allows_image_path(
+                        "s-media", image, {"image/png"}
+                    )
+                )
+
+    def test_session_media_token_rejects_non_image_path(self):
+        from api import routes
+
+        with tempfile.TemporaryDirectory() as tmpd:
+            text_file = pathlib.Path(tmpd) / "notes.txt"
+            text_file.write_text("secret", encoding="utf-8")
+            session = SimpleNamespace(messages=[{"role": "assistant", "content": f"MEDIA:{text_file}"}])
+            with mock.patch.object(routes, "get_session", return_value=session):
+                self.assertFalse(
+                    routes._session_media_token_allows_image_path(
+                        "s-media", text_file, {"image/png"}
+                    )
+                )
 
 
 # ── Integration tests: live server on TEST_PORT ───────────────────────────────
