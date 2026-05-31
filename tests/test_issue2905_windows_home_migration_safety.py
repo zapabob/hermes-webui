@@ -130,6 +130,7 @@ def test_legacy_dir_present_but_empty_does_not_divert(windows_env):
     assert result == new_home
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only fallback assertion")
 def test_does_nothing_on_posix(monkeypatch, tmp_path):
     """On POSIX (os.name != 'nt') the resolver always returns ~/.hermes,
     regardless of any LOCALAPPDATA value — the fix is Windows-only."""

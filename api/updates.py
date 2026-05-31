@@ -474,7 +474,21 @@ def _can_fast_forward_to(path, ref):
     return bool(ok)
 
 
-def _select_apply_compare_ref(path):
+def _remote_has_tag(path, tag, remote='origin'):
+    """Return True when the update remote advertises ``tag``.
+
+    Tags are repo-global once fetched, so a checkout with both ``origin`` and an
+    ``upstream`` remote can retain release tags that the update remote does not
+    have. The apply path pulls from ``origin``; a release tag is only actionable
+    when that same remote can serve it.
+    """
+    if not tag:
+        return False
+    out, ok = _run_git(['ls-remote', '--tags', remote, f'refs/tags/{tag}'], path, timeout=10)
+    return bool(ok and out.strip())
+
+
+def _select_apply_compare_ref(path, *, require_remote_tag=False):
     """Return the same remote ref family that the update check reports.
 
     The update banner prefers published release tags when they exist. Applying
@@ -492,25 +506,28 @@ def _select_apply_compare_ref(path):
     tags = _release_tags(path)
     if tags:
         latest_tag = tags[0]
-        current_tag = _current_release_tag(path)
-        behind = _release_gap(tags, current_tag, latest_tag)
-        # Mirror the check side exactly: fall through to the branch comparison
-        # whenever the checkout has already moved past the release tag that the
-        # banner would otherwise advertise. The common case is behind == 0 and
-        # HEAD is past its nearest tag, but main-tracking checkouts can also
-        # have behind > 0 after fetching a newer tag that HEAD already contains
-        # (#3140). In both cases applying the tag would no-op, move backwards,
-        # or fail fast-forward; branch comparison is the truthful update path.
-        if (
-            behind == 0 and _head_is_past_latest_tag(path, current_tag)
-        ) or (
-            behind > 0 and _head_contains_ref(path, latest_tag)
-        ) or (
-            behind > 0 and not _can_fast_forward_to(path, latest_tag)
-        ):
+        if require_remote_tag and not _remote_has_tag(path, latest_tag):
             pass
         else:
-            return latest_tag
+            current_tag = _current_release_tag(path)
+            behind = _release_gap(tags, current_tag, latest_tag)
+            # Mirror the check side exactly: fall through to the branch comparison
+            # whenever the checkout has already moved past the release tag that the
+            # banner would otherwise advertise. The common case is behind == 0 and
+            # HEAD is past its nearest tag, but main-tracking checkouts can also
+            # have behind > 0 after fetching a newer tag that HEAD already contains
+            # (#3140). In both cases applying the tag would no-op, move backwards,
+            # or fail fast-forward; branch comparison is the truthful update path.
+            if (
+                behind == 0 and _head_is_past_latest_tag(path, current_tag)
+            ) or (
+                behind > 0 and _head_contains_ref(path, latest_tag)
+            ) or (
+                behind > 0 and not _can_fast_forward_to(path, latest_tag)
+            ):
+                pass
+            else:
+                return latest_tag
 
     upstream, ok = _run_git(['rev-parse', '--abbrev-ref', '@{upstream}'], path)
     if ok and upstream:
@@ -520,13 +537,16 @@ def _select_apply_compare_ref(path):
     return f'origin/{branch}'
 
 
-def _check_repo_release(path, name):
+def _check_repo_release(path, name, *, require_remote_tag=False):
     """Check if a git repo is behind its latest published release tag."""
     tags = _release_tags(path)
     if not tags:
         return None
 
     latest_tag = tags[0]
+    if require_remote_tag and not _remote_has_tag(path, latest_tag):
+        return None
+
     current_tag = _current_release_tag(path)
     behind = _release_gap(tags, current_tag, latest_tag)
 
@@ -674,7 +694,7 @@ def _check_repo(path, name):
             'stale_check': True,
         }
 
-    release_info = _check_repo_release(path, name)
+    release_info = _check_repo_release(path, name, require_remote_tag=True)
     if release_info is not None:
         return release_info
 
@@ -1097,7 +1117,7 @@ def apply_force_update(target: str) -> dict:
                 'message': 'Could not reach the remote repository. Check your connection.',
             }
 
-        compare_ref = _select_apply_compare_ref(path)
+        compare_ref = _select_apply_compare_ref(path, require_remote_tag=True)
 
         # Discard local modifications then reset to remote HEAD
         _run_git(['checkout', '.'], path)
@@ -1158,7 +1178,7 @@ def _apply_update_inner(target):
             ),
         }
 
-    compare_ref = _select_apply_compare_ref(path)
+    compare_ref = _select_apply_compare_ref(path, require_remote_tag=True)
 
     # Check for dirty working tree (ignore untracked files — git stash
     # doesn't include them, so stashing on '??' alone leaves nothing to pop)

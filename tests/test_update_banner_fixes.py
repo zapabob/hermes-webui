@@ -192,6 +192,8 @@ class TestUpdateChecker:
                 return '', True
             if args[:3] == ['tag', '--list', 'v*']:
                 return 'v2026.5.7\nv2026.4.30', True
+            if args == ['ls-remote', '--tags', 'origin', 'refs/tags/v2026.5.7']:
+                return 'abc123\trefs/tags/v2026.5.7', True
             if args[:3] == ['describe', '--tags', '--abbrev=0']:
                 return 'v2026.5.7', True
             if args[:2] == ['remote', 'get-url']:
@@ -222,6 +224,8 @@ class TestUpdateChecker:
                 return '', True
             if args[:3] == ['tag', '--list', 'v*']:
                 return 'v0.51.35\nv0.51.34\nv0.51.33', True
+            if args == ['ls-remote', '--tags', 'origin', 'refs/tags/v0.51.35']:
+                return 'abc123\trefs/tags/v0.51.35', True
             if args[:3] == ['describe', '--tags', '--abbrev=0']:
                 return 'v0.51.34', True
             if args == ['merge-base', '--is-ancestor', 'HEAD', 'v0.51.35']:
@@ -560,6 +564,8 @@ class TestSuccessfulUpdateReturnsRestartScheduled:
                 return '', True
             if args[0] == 'tag':
                 return 'v0.51.106\nv0.51.105\nv0.51.104', True
+            if args == ['ls-remote', '--tags', 'origin', 'refs/tags/v0.51.106']:
+                return 'abc123\trefs/tags/v0.51.106', True
             if args == ['describe', '--tags', '--abbrev=0']:
                 return 'v0.51.105', True
             if args == ['merge-base', '--is-ancestor', 'v0.51.106', 'HEAD']:

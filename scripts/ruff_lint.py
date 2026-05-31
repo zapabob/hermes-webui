@@ -47,7 +47,13 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(
-        cmd, cwd=REPO_ROOT, capture_output=True, text=True, **kw
+        cmd,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        **kw,
     )
 
 

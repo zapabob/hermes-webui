@@ -709,6 +709,7 @@ def test_check_repo_release_falls_through_when_latest_tag_is_not_ff_reachable(tm
 
 def test_select_apply_compare_ref_falls_through_when_latest_tag_is_not_ff_reachable(tmp_path):
     """Apply path mirrors the ff-unreachable release-tag fall-through."""
+
     (tmp_path / '.git').mkdir()
 
     def fake_git(args, cwd, timeout=10):
@@ -730,3 +731,57 @@ def test_select_apply_compare_ref_falls_through_when_latest_tag_is_not_ff_reacha
         ref = updates._select_apply_compare_ref(tmp_path)
 
     assert ref == 'origin/main'
+
+
+def test_check_repo_ignores_release_tag_missing_from_update_remote(tmp_path):
+    """Fork checkouts can retain upstream-only release tags that origin lacks."""
+    (tmp_path / '.git').mkdir()
+
+    def fake_git(args, cwd, timeout=10):
+        if args == ['fetch', 'origin', '--tags', '--force']:
+            return '', True
+        if args == ['tag', '--list', 'v*', '--sort=-v:refname']:
+            return 'v2026.5.29.2\nv2026.5.29', True
+        if args == ['ls-remote', '--tags', 'origin', 'refs/tags/v2026.5.29.2']:
+            return '', True
+        if args == ['rev-parse', '--abbrev-ref', '@{upstream}']:
+            return 'origin/main', True
+        if args == ['rev-list', '--count', 'HEAD..origin/main']:
+            return '0', True
+        if args == ['merge-base', 'HEAD', 'origin/main']:
+            return 'abc1234abc1234abc1234abc1234abc1234a', True
+        if args == ['rev-parse', '--short', 'abc1234abc1234abc1234abc1234abc1234a']:
+            return 'abc1234', True
+        if args == ['rev-parse', '--short', 'origin/main']:
+            return 'def5678', True
+        if args == ['remote', 'get-url', 'origin']:
+            return 'https://github.com/zapabob/hermes-agent.git', True
+        raise AssertionError(f'unexpected git args: {args!r}')
+
+    with patch.object(updates, '_run_git', side_effect=fake_git):
+        info = updates._check_repo(tmp_path, 'agent')
+
+    assert info is not None
+    assert info['behind'] == 0
+    assert info['branch'] == 'origin/main'
+    assert info.get('release_based') is not True
+
+
+def test_select_apply_compare_ref_falls_through_when_tag_missing_from_update_remote(tmp_path):
+    """Update Now must not pull a release tag that the update remote lacks."""
+
+    (tmp_path / '.git').mkdir()
+
+    def fake_git(args, cwd, timeout=10):
+        if args == ['tag', '--list', 'v*', '--sort=-v:refname']:
+            return 'v2026.5.29.2\nv2026.5.29', True
+        if args == ['ls-remote', '--tags', 'origin', 'refs/tags/v2026.5.29.2']:
+            return '', True
+        if args == ['rev-parse', '--abbrev-ref', '@{upstream}']:
+            return 'origin/main', True
+        raise AssertionError(f'unexpected git args: {args!r}')
+
+    with patch.object(updates, '_run_git', side_effect=fake_git):
+        apply_ref = updates._select_apply_compare_ref(tmp_path, require_remote_tag=True)
+
+    assert apply_ref == 'origin/main'
