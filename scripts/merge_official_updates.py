@@ -18,6 +18,14 @@ from pathlib import Path
 DEFAULT_OFFICIAL_URL = "https://github.com/nesquena/hermes-webui.git"
 
 
+def configure_stdio() -> None:
+    """Prefer UTF-8 console output on Windows hosts with legacy code pages."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
 def run_git(args: list[str], repo: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", *args],
@@ -125,4 +133,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    configure_stdio()
     sys.exit(main())

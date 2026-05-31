@@ -7,6 +7,11 @@
 
 - Add `scripts/merge_official_updates.py` for repeatable official upstream fetch/merge runs while preserving local commits.
 - Highlight this fork's local upstream-merge, OpenClaw/OpenCode, and native Windows wrapper differences in `README.md`.
+- Native Windows wrapper now injects `HERMES_WEBUI_PASSWORD` at launch from the process environment, `HERMES_WEBUI_PASSWORD_FILE`, `HERMES_HOME\.env`, or the legacy WebUI `.env`, and can open the browser with `-Open` or `HERMES_WEBUI_OPEN_ON_START=1`.
+
+### Fixed
+
+- Git-backed WebUI version detection now decodes subprocess output as UTF-8 with replacement and tolerates missing capture buffers, preventing Windows legacy-console decode failures when dirty diffs or commit messages contain Unicode.
 
 ## [v0.51.184] — 2026-05-31 — Release FD (stage-batchD — raw audio upload mode + scroll-preserve + non-POSIX test skip)
 

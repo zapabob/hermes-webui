@@ -165,10 +165,10 @@ def _run_git(args, cwd, timeout=10):
     try:
         r = subprocess.run(
             ['git'] + args, cwd=str(cwd), capture_output=True,
-            text=True, timeout=timeout,
+            text=True, encoding='utf-8', errors='replace', timeout=timeout,
         )
-        stdout = r.stdout.strip()
-        stderr = r.stderr.strip()
+        stdout = (r.stdout or '').strip()
+        stderr = (r.stderr or '').strip()
         if r.returncode == 0:
             return stdout, True
         return stderr or stdout or f"git exited with status {r.returncode}", False

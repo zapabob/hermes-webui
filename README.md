@@ -48,7 +48,7 @@ This gives you nearly **1:1 parity with Hermes CLI from a convenient web UI** wh
 ## Local fork highlights
 
 This fork tracks the official `nesquena/hermes-webui` API and release stream,
-with the current merge including upstream `v0.51.137`. Local changes are kept
+with the current merge including upstream `v0.51.184`. Local changes are kept
 small and operational:
 
 - **Official-first merge flow:** `scripts/merge_official_updates.py` fetches the
@@ -60,7 +60,10 @@ small and operational:
   work unchanged.
 - **Native Windows convenience wrapper:** `scripts/windows/start-hermes-webui-native.ps1`
   sets the common native-Windows WebUI environment and delegates to the tracked
-  `start.ps1`, preserving the official launcher behavior underneath.
+  `start.ps1`, preserving the official launcher behavior underneath. It can
+  inject `HERMES_WEBUI_PASSWORD` at launch from the process environment,
+  `HERMES_WEBUI_PASSWORD_FILE`, `HERMES_HOME\.env`, or the legacy WebUI `.env`,
+  and `-Open` / `HERMES_WEBUI_OPEN_ON_START=1` opens the browser after readiness.
 - **Upstream API follow-through:** local provider and launcher behavior is
   layered on top of the official config, bootstrap, and Windows path defaults
   instead of replacing those contracts.
@@ -248,6 +251,7 @@ A community-maintained native Windows setup is documented at [@markwang2658/herm
 - **What works:** chat, workspace browser, session management, all themes.
 - **Known limitations:** some POSIX-style file paths surface in the workspace browser; bash-assuming agent tools may not work natively.
 - **Native Windows setup:** install Python 3.11+, then from the hermes-agent root in PowerShell: `python -m venv venv` → `pip install -r requirements.txt` → `pwsh .\start.ps1` (it auto-discovers `venv\Scripts\python.exe`).
+- **Fork native wrapper:** from this checkout, `.\scripts\windows\start-hermes-webui-native.ps1 -Open` starts the sibling `hermes-agent` checkout, injects a configured WebUI password without storing it in the checkout `.env`, logs under `HERMES_HOME\logs`, and opens `http://127.0.0.1:8787/` after the server is reachable.
 - **WSL2 relationship:** not a prerequisite — a WSL2-built venv (`venv/bin/python`, ELF) isn't invokable by native Windows Python, so use the native setup above. WSL2 stays useful as a parallel install if you want the full `bootstrap.py` + Linux runtime.
 
 If provider setup is still incomplete after install, the onboarding wizard will point you to finish it with `hermes model` instead of trying to replicate the full CLI setup in-browser.
