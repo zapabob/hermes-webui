@@ -13,6 +13,39 @@
 
 - Add regression coverage for Git-backed WebUI version detection on Windows legacy-console decode failures, including missing capture buffers after decode-thread failures.
 
+## [v0.51.190] — 2026-05-31 — Release FJ (stage-batch2 — Windows upgrade state-stranding hotfix + gateway banner + quiet tool previews)
+
+### Fixed
+- **Windows upgrade no longer strands WebUI state (data-loss-class, priority).** v0.51.134 moved the Windows default Hermes home from `%USERPROFILE%\.hermes` to `%LOCALAPPDATA%\hermes` without a migration, so upgrading users opened an empty app (sessions, pins, UI settings appeared lost — actually just at the address the new build no longer read). `_platform_default_hermes_home()` now prefers the legacy `%USERPROFILE%\.hermes` **only** on the exact post-upgrade fingerprint (legacy holds real `webui/` state AND the new location is not yet established), and `api/profiles.py` delegates to the same resolver so the two can never drift. Non-destructive and self-healing — no files are moved; affected users recover on next launch with no action. Markers key on WebUI-owned `webui/` state only (not agent `auth.json`/`config.yaml`) so a long-time agent user installing WebUI fresh isn't wrongly diverted. Closes #2905 (#3279).
+- **"Gateway not configured" banner on two-container Docker first deploy.** `GET /api/gateway/status` treated all `alive is None` health payloads as unconfigured-unless-`identity_map`, so a freshly-started gateway that hadn't ticked `updated_at` yet (and had no conversations) reported "not configured." A stale-but-**running** gateway (reason `gateway_stale_running_state`, or a `gateway_state == "running"` detail) now reports `configured = True`; a stale-**stopped** gateway deliberately still falls through to the `identity_map` signal so a stopped root gateway reads as "not configured" per #1944. Closes #3194 (#3279).
+- Collapsed tool-call previews stay quiet: instead of falling back to raw result JSON (which made tool-heavy turns look like debug logs), a settled collapsed tool card now shows a compact argument summary (with verbose/secret-bearing keys like `content`/`patch`/`api_key`/`token` excluded) or a short status, keeping the full result inside the expandable detail body (#3267, @ai-ag2026).
+
+## [v0.51.189] — 2026-05-31 — Release FI (stage-batch1 — ruff lint gate + SSE refresh dedupe + tooltip i18n)
+
+### Added
+- **Forward-looking Python lint gate (ruff).** A curated `[tool.ruff]` ruleset (E9 syntax/runtime + F pyflakes + B bugbear — high-signal correctness rules, no style/formatting families) now gates **new and changed Python code** in CI (`tests.yml` `lint` job) and as part of the maintainer pre-release pre-gate. It is the Python twin of the existing ESLint runtime guard for `static/*.js`. Crucially it is **line-scoped** (`scripts/ruff_lint.py --diff`): it flags violations only on lines a change adds or modifies, so it keeps incoming code clean **without** reformatting the existing tree's cosmetic backlog (a separate, deferred, maintainer-run decision). `tests/test_ruff_forward_lint.py` additionally holds the whole tree free of E9 errors and skips cleanly when ruff isn't installed. See TESTING.md > "Python lint gate (ruff)". Closes #3273 (#3275).
+
+### Fixed
+- Gateway SSE reconnect no longer triggers a phantom "new dialog created" sidebar refresh: the initial sessions snapshot pushed on every reconnect is now compared against the current gateway-session set and `renderSessionList()` is skipped when nothing changed (#3270, @PINKIIILQWQ).
+- Raw-audio recording mic tooltip now uses a recording-specific i18n key instead of the dictation "Stop" label; sidebar lineage/child tooltip suffixes are localized across the locale catalog; and the localized read-only title hover hint for imported sessions is restored. Closes #3242, #3214 (#3272, @ai-ag2026).
+
+## [v0.51.188] — 2026-05-31 — Release FH (stage-batchH — configured runner-client boundary, default-off)
+
+### Added
+- **Configured runner-client boundary** for the `runner-local` runtime adapter (RFC `hermes-run-adapter-contract`, tracking #1925, Slice 4c/4d). When — and only when — an operator sets `HERMES_WEBUI_RUNNER_BASE_URL`, WebUI delegates the agent run to that external/supervised runner over a small JSON HTTP client (start / observe / status / cancel / approval / clarify / queue / goal) and bridges the runner's events through the existing SSE stream route, instead of owning the run in the main WebUI process. **Default-off and fully reversible:** with no endpoint configured, the factory preserves the existing bounded "runner-local not configured" path and the live in-process streaming path is unchanged — no behavior change for existing users. New `api/runner_client.py` (`HttpRunnerClient` + `runner_client_configured()`) plus additive `_runner_*` SSE-bridge helpers in `api/routes.py`; the legacy `_run_agent_streaming` control flow is untouched (#3073, @AJV20).
+
+## [v0.51.187] — 2026-05-31 — Release FG (stage-batchG — workspace-preview persistence + scroll-intent window)
+
+### Fixed
+- Workspace file preview no longer closes when a chat response finishes and the UI refreshes the workspace file tree. Background `loadDir('.')` on stream `done` now preserves an open preview instead of always calling `clearPreview()`, and reloads the open file when a write/edit tool touched that path during the turn (skipping reload while the preview has unsaved local edits) (#3262, @pamnard).
+- During streaming, scrolling up to read earlier content no longer snaps back to the bottom after a brief pause: the upward-scroll intent window was widened from 450ms to 2000ms so DOM-layout changes from the markdown parser / tool-card insertions are still recognized as co-occurring with user intent and don't re-pin the view. Downward scroll, the scroll-to-bottom button, and trackpad-momentum protection are unaffected (#3250, @emanon312).
+
+## [v0.51.186] — 2026-05-31 — Release FF (stage-batchF — update-checker ff-reachability fall-through + utf-8 git-output test coverage)
+
+### Fixed
+- Agent self-update no longer advertises or applies unreachable release tags when the checkout tracks `main` past an older tag but the newest published tag lives on a divergent side branch (for example `v2026.5.29` → `v2026.5.29.2`). The update checker and apply path now fall through to the configured upstream branch when `git pull --ff-only <latest-tag>` cannot fast-forward, matching the existing #2653/#3140 release-vs-branch routing (#3257, @pamnard).
+- Added regression coverage pinning `_run_git()`'s UTF-8 decoding (`encoding='utf-8'`, `errors='replace'`) and its defensive `None`-stdout guard, so version detection cannot crash on non-UTF-8 Windows console output (#3254, @zapabob).
+
 ## [v0.51.185] — 2026-05-31 — Release FE (stage-batchE — clarify-card bug-fix batch: identical-prompt dedup + autofill guard + GBK startup crash)
 
 ### Fixed
