@@ -15,6 +15,24 @@
 - Agent/WebUI update checks now ignore local release tags that are missing from the configured update remote, preventing fork checkouts with upstream-only tags from advertising an update that `git pull origin <tag>` cannot fetch.
 - Native Windows startup now prefers an Agent `.venv` interpreter when present before falling back to the legacy `venv` path.
 
+## [v0.51.193] — 2026-06-01 — Release FM (stage-batch5 — ctl dotenv opt-out + workspace inline-open + gateway reply polish)
+
+### Fixed
+- `ctl.sh` now honors `HERMES_WEBUI_NO_DOTENV=1`, letting tests and scripted launches opt out of repo-local `.env` loading so host-specific `HERMES_WEBUI_STATE_DIR` values do not make the ctl test suite flaky. Closes #3246 (#3304, @AJV20).
+- Workspace **Open in browser** now opens HTML files inline (with the same `inline=1` + CSP sandbox isolation as the file preview) instead of forcing a download, and uses `noopener` for the new tab (#3305, @xz-dev).
+- Gateway-backed chat now carries the same WebUI final-answer polish guidance as the in-process chat paths, so terse scratchpad fragments such as "Need script" are not encouraged as visible assistant replies (#3301, @AJV20).
+
+## [v0.51.192] — 2026-05-31 — Release FL (stage-batch4 — per-model context_length default-only guard)
+
+### Fixed
+- A global `model.context_length` cap (set in config for the default model, e.g. 232000) no longer silently shrinks **non-default** models' real context windows. The cap is now applied only when the session model equals `model.default`; other models (e.g. a 1M-context variant) keep their real metadata window. The guard is applied consistently across the session context-length resolver (`api/routes.py`), the per-turn persistence path, and the live SSE usage payload, and the auto-compress `threshold_tokens` is rescaled to the real cap so the context-window indicator and compression trigger reflect the actual window. The live-usage perf path caches the resolved per-model window once per stream (it runs ~10×/sec during streaming) so non-default-model streams don't take a config/metadata lookup on every metering tick. Backend-only; default-model sessions are unaffected. Closes #3256 (#3263, @allenliang2022).
+
+## [v0.51.191] — 2026-05-31 — Release FK (stage-batch3 — skills-detail markdown styling + launchd duplicate-start guard)
+
+### Fixed
+- Skills detail view now renders `SKILL.md` markdown with the same `.preview-md` typography used by Memory and Notes, instead of unstyled `renderMd()` output. Linked markdown skill files opened from the detail view use the same wrapper plus scoped post-render `highlightCode` / KaTeX enhancement (#3284, @pamnard).
+- `ctl.sh start` now refuses to launch a second WebUI instance when a launchd-managed job already owns it (macOS), instead of racing the launchd instance into repeated `Address already in use` churn on port 8787. The guard is macOS/launchd-only, no-ops on every non-launchd path, and can be overridden with `HERMES_WEBUI_CTL_ALLOW_LAUNCHD_CONFLICT=1`; `docs/supervisor.md` documents launchd as the single source of truth. Closes #3289 (#3291, @andrewkangkr).
+
 ## [v0.51.190] — 2026-05-31 — Release FJ (stage-batch2 — Windows upgrade state-stranding hotfix + gateway banner + quiet tool previews)
 
 ### Fixed
