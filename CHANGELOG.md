@@ -14,6 +14,18 @@
 - Agent/WebUI update checks now ignore local release tags that are missing from the configured update remote, preventing fork checkouts with upstream-only tags from advertising an update that `git pull origin <tag>` cannot fetch.
 - Native Windows startup now prefers an Agent `.venv` interpreter when present before falling back to the legacy `venv` path.
 
+## [v0.51.434] -- 2026-06-15 -- Release OU (reject symlinked skill files on save)
+
+### Fixed
+
+- **Saving a skill no longer writes through a symlinked `SKILL.md`.** `_handle_skill_save` now rejects a symlinked skill file with a 400 instead of following it and overwriting the link's target, extending the workspace symlink hardening (#4217 / #4234) to the skills surface. (#4240)
+
+## [v0.51.433] -- 2026-06-15 -- Release OT (reject symlinked entries in /api/file/save, #4234)
+
+### Fixed
+
+- **Saving to a workspace symlink no longer writes through to the symlink's target.** `/api/file/save` resolved the final symlink before writing, so saving to a workspace symlink `link.txt -> real.txt` overwrote `real.txt` instead of the link. It now rejects a symlinked path with a 400, checked before the existence probe so dangling symlinks are caught too, completing the symlink hardening from #4217 for the write path. (#4234)
+
 ## [v0.51.432] — 2026-06-15 — Release OS (TUI sessions discoverable in the sidebar)
 
 ### Fixed
