@@ -767,6 +767,8 @@ def test_check_repo_ignores_release_tag_missing_from_update_remote(tmp_path):
             return 'def5678', True
         if args == ['remote', 'get-url', 'origin']:
             return 'https://github.com/zapabob/hermes-agent.git', True
+        if args == ['diff-index', '--quiet', 'HEAD', '--']:
+            return '', True
         raise AssertionError(f'unexpected git args: {args!r}')
 
     with patch.object(updates, '_run_git', side_effect=fake_git):

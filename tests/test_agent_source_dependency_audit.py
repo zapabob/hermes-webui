@@ -26,6 +26,7 @@ def _run_audit() -> dict[str, object]:
         cwd=REPO,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     )
     return json.loads(proc.stdout)
@@ -37,6 +38,7 @@ def _run_markdown_audit() -> str:
         cwd=REPO,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     )
     return proc.stdout
