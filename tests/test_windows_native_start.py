@@ -18,5 +18,6 @@ def test_start_ps1_loads_dotenv_and_runs_server_directly():
 def test_bootstrap_native_windows_requires_existing_agent_before_install_fallback():
     src = (REPO / "bootstrap.py").read_text(encoding="utf-8")
     assert "Please run it from Linux, macOS, or inside WSL2" not in src
-    assert "Native Windows bootstrap cannot run" in src
+    assert "Native Windows bootstrap is experimental" in src
+    assert "Auto-install is not supported on native Windows" in src
     assert "HERMES_WEBUI_AGENT_DIR" in src
