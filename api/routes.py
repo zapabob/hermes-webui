@@ -249,6 +249,95 @@ _CLIENT_EVENT_ALLOWED_FIELDS = {
 }
 
 
+def _normalize_cron_job_ids(job_ids) -> list[str]:
+    seen = set()
+    normalized = []
+    for job_id in job_ids or []:
+        jid = str(job_id or "").strip()
+        if not jid or jid in seen:
+            continue
+        seen.add(jid)
+        normalized.append(jid)
+    return normalized
+
+
+def _latest_cron_session_info_for_jobs(
+    job_ids, completed_job_ids=None
+) -> dict[str, dict[str, int | str | None]]:
+    """Return newest persisted cron session info keyed by completed cron job id."""
+    normalized = _normalize_cron_job_ids(job_ids)
+    requested = _normalize_cron_job_ids(completed_job_ids if completed_job_ids is not None else job_ids)
+    if not requested:
+        return {}
+    if not normalized:
+        return {jid: {"session_id": "", "message_count": None} for jid in requested}
+    db_path = _active_state_db_path()
+    if not db_path or not Path(db_path).exists():
+        return {jid: {"session_id": "", "message_count": None} for jid in requested}
+    try:
+        with closing(sqlite3.connect(str(db_path))) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(sessions)")
+            session_cols = {row[1] for row in cur.fetchall()}
+            if "id" not in session_cols or "source" not in session_cols:
+                return {jid: {"session_id": "", "message_count": None} for jid in requested}
+            select_message_count = (
+                "s.message_count AS message_count"
+                if "message_count" in session_cols
+                else "NULL AS message_count"
+            )
+            if "started_at" in session_cols:
+                query = f"""
+                    SELECT s.id,
+                           {select_message_count}
+                    FROM sessions s
+                    WHERE LOWER(COALESCE(s.source, '')) = 'cron'
+                    ORDER BY COALESCE(s.started_at, 0) DESC, s.id DESC  -- newest start, not last activity
+                """
+            else:
+                query = f"""
+                    SELECT s.id,
+                           {select_message_count}
+                    FROM sessions s
+                    WHERE LOWER(COALESCE(s.source, '')) = 'cron'
+                    ORDER BY s.id DESC
+                """
+            cur.execute(query)
+            results = {
+                jid: {"session_id": "", "message_count": None} for jid in requested
+            }
+            requested_ids = set(requested)
+            prefixes = {jid: f"cron_{jid}_" for jid in normalized}
+            for row in cur.fetchall():
+                sid = str(row["id"] or "")
+                if not sid:
+                    continue
+                matches = [
+                    jid
+                    for jid in normalized
+                    if sid.startswith(prefixes[jid])
+                ]
+                if matches:
+                    jid = max(matches, key=len)
+                    if jid not in requested_ids or results[jid]["session_id"]:
+                        continue
+                    results[jid] = {
+                        "session_id": sid,
+                        "message_count": (
+                            int(row["message_count"])
+                            if row["message_count"] is not None
+                            else None
+                        ),
+                    }
+                if all(info["session_id"] for info in results.values()):
+                    break
+            return results
+    except sqlite3.Error:
+        return {jid: {"session_id": "", "message_count": None} for jid in requested}
+
+
+
 def _session_field(session, field, default=None):
     if isinstance(session, dict):
         return session.get(field, default)
@@ -335,7 +424,11 @@ def _visible_pinned_lineage_ids(session_rows) -> set[str]:
 # (mcp_server.py) can import it without duplicating the visibility model.
 # Re-exported here so existing `_profiles_match(...)` call sites in this
 # module keep resolving without per-call-site refactors.
-from api.profiles import _profiles_match  # noqa: F401, E402  (re-export)
+from api.profiles import (  # noqa: F401, E402  (re-export)
+    _profiles_match,
+    get_active_profile_name,
+    get_active_profile_name as _get_active_profile_name,
+)
 
 
 def _all_profiles_query_flag(parsed_url) -> bool:
@@ -347,6 +440,22 @@ def _all_profiles_query_flag(parsed_url) -> bool:
     qs = parse_qs(parsed_url.query)
     raw = qs.get('all_profiles', [''])[0].strip().lower()
     return raw in ('1', 'true', 'yes', 'on')
+
+
+def _session_visible_to_active_profile(session_profile, handler=None) -> bool:
+    """Return whether a detail-load session belongs to the active profile.
+
+    Real request handlers must enforce the same profile boundary as
+    /api/sessions, even when the request has no hermes_profile cookie and the
+    process-level active profile is the default/root profile. Direct unit-callers
+    without a request handler keep the historical metadata-load behavior.
+    """
+    if handler is None:
+        return True
+    active_profile = _get_active_profile_name()
+    if not isinstance(session_profile, str):
+        session_profile = None
+    return _profiles_match(session_profile, active_profile)
 
 
 def _active_skills_dir() -> Path:
@@ -1173,6 +1282,10 @@ _PROVIDER_ALIASES = {
     "gpt": "openai",
     "gemini": "google",
     "openai-codex": "openai",
+    "openai-api": "openai",
+    "google-gemini": "google",
+    "google-ai-studio": "google",
+    "claude-code": "anthropic",
 }
 
 # OpenAI-compatible /v1/models endpoints for live model discovery.
@@ -1366,14 +1479,18 @@ def _session_list_cache_path_stamp(path: Path | None) -> tuple[int, int]:
         return (0, 0)
 
 
-def _session_list_cache_source_stamp(key: tuple) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
+def _session_list_cache_source_stamp(key: tuple) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]]:
     _cache_profile, _cache_all_profiles, cache_show_cli_sessions, *_rest = key
     if not cache_show_cli_sessions:
-        return ((0, 0), (0, 0), (0, 0))
+        return ((0, 0), (0, 0), (0, 0), (0, 0), (0, 0))
     try:
         state_db_path = Path(_active_state_db_path())
     except Exception:
         state_db_path = None
+    try:
+        state_db_wal_path = state_db_path.with_name(f"{state_db_path.name}-wal") if state_db_path is not None else None
+    except Exception:
+        state_db_wal_path = None
     try:
         gateway_metadata_path = _gateway_session_metadata_path()
     except Exception:
@@ -1382,10 +1499,16 @@ def _session_list_cache_source_stamp(key: tuple) -> tuple[tuple[int, int], tuple
         session_index_path = SESSION_DIR / "_index.json"
     except Exception:
         session_index_path = None
+    try:
+        settings_file = SETTINGS_FILE
+    except Exception:
+        settings_file = None
     return (
         _session_list_cache_path_stamp(state_db_path),
+        _session_list_cache_path_stamp(state_db_wal_path),
         _session_list_cache_path_stamp(gateway_metadata_path),
         _session_list_cache_path_stamp(session_index_path),
+        _session_list_cache_path_stamp(settings_file),
     )
 
 
@@ -1469,7 +1592,7 @@ def _build_session_list_cache_payload(
     webui_sessions = [_normalize_sidebar_source_flags(s) for s in webui_sessions]
     if show_cli_sessions:
         diag_stage("get_cli_sessions")
-        cli = get_cli_sessions(source_filter=source_filter)
+        cli = get_cli_sessions(source_filter=source_filter, all_profiles=all_profiles)
         diag_stage("merge_cli_sessions")
         cli_by_id = {s["session_id"]: s for s in cli}
         # #3238: reconcile orphaned imported-CLI sidecars. When a CLI
@@ -1616,10 +1739,7 @@ def _session_list_payload_to_response(payload: dict) -> dict:
     safe_merged = []
     runtime_rows = _session_list_cache_overlay_runtime_rows(payload.get("sessions", []) or [])
     for s in runtime_rows:
-        item = dict(s) if isinstance(s, dict) else {}
-        if isinstance(item.get("title"), str):
-            item["title"] = _redact_text(item["title"])
-        item["attention"] = _session_attention_summary(str(item.get("session_id") or ""))
+        item = _sidebar_session_response_item(s) if isinstance(s, dict) else {}
         safe_merged.append(item)
     return {
         "sessions": safe_merged,
@@ -1758,6 +1878,7 @@ from api.config import (
     CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS,
     load_settings,
     save_settings,
+    SETTINGS_FILE,
     set_hermes_default_model,
     model_with_provider_context,
     get_reasoning_status,
@@ -2788,6 +2909,13 @@ def _handle_client_event_log(handler, body: dict) -> bool:
     return j(handler, {"ok": True, "event": payload.get("event")}) or True
 
 
+def _starts_token(raw: str, prefix: str) -> bool:
+    if not raw.startswith(prefix):
+        return False
+    rest = raw[len(prefix):]
+    return rest == "" or rest[0] in ":/"
+
+
 def _normalize_provider_id(value: str | None) -> str:
     raw = str(value or "").strip().lower()
     if not raw:
@@ -2804,7 +2932,7 @@ def _normalize_provider_id(value: str | None) -> str:
         ("openrouter", "openrouter"),
         ("custom", "custom"),
     ):
-        if raw.startswith(prefix):
+        if _starts_token(raw, prefix):
             return normalized
     # Unknown prefix — return empty so callers treat it as "no match" and pass
     # the model through unchanged rather than incorrectly stripping it.
@@ -3359,11 +3487,12 @@ def _resolve_compatible_session_model_state(
         model_provider_from_name = _normalize_provider_id(model_prefix) if "/" in model else ""
 
         model_family = ""
-        model_lower = model.lower()
-        for bare_prefix in ("gpt", "claude", "gemini"):
-            if model_lower.startswith(bare_prefix):
-                model_family = _normalize_provider_id(bare_prefix)
-                break
+        if "/" not in model:
+            model_lower = model.lower()
+            for bare_prefix in ("gpt", "claude", "gemini"):
+                if model_lower.startswith(bare_prefix):
+                    model_family = _normalize_provider_id(bare_prefix)
+                    break
 
         if model_family and model_family != _profile_provider_normalized:
             if explicit_model_pick:
@@ -3754,16 +3883,50 @@ def _lookup_gateway_session_identity(session_id: str) -> dict:
     return metadata if isinstance(metadata, dict) else {}
 
 
-def _lookup_cli_session_metadata(session_id: str) -> dict:
+def _lookup_cli_session_metadata(session_id: str, *, all_profiles: bool = False) -> dict:
     if not session_id:
         return {}
     try:
-        for row in get_cli_sessions():
+        for row in get_cli_sessions(all_profiles=all_profiles):
             if row.get("session_id") == session_id:
                 return row
     except Exception:
         return {}
     return {}
+
+
+def _request_wants_all_profiles_import(body) -> bool:
+    if not isinstance(body, dict):
+        return False
+    value = body.get("all_profiles")
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _normalize_import_profile_value(value):
+    profile = str(value or "").strip()
+    if not profile:
+        return None
+    try:
+        from api.profiles import _PROFILE_ID_RE
+        if profile != "default" and not _PROFILE_ID_RE.fullmatch(profile):
+            return ""
+    except Exception:
+        pass
+    return profile
+
+
+def _resolve_cli_import_metadata(session_id: str, *, requested_profile=None, allow_all_profiles: bool = False) -> dict:
+    cli_meta = _lookup_cli_session_metadata(session_id)
+    if cli_meta and (not requested_profile or _profiles_match(cli_meta.get("profile"), requested_profile)):
+        return cli_meta
+    if not allow_all_profiles:
+        return {}
+    cli_meta = _lookup_cli_session_metadata(session_id, all_profiles=True)
+    if cli_meta and requested_profile and not _profiles_match(cli_meta.get("profile"), requested_profile):
+        return {}
+    return cli_meta or {}
 
 
 def _messaging_session_identity(session: dict, raw_source: str) -> str:
@@ -4417,6 +4580,46 @@ def _normalize_sidebar_source_flags(session: dict) -> dict:
     return normalized
 
 
+def _reconcile_session_detail_source_flags(session: dict, state_meta: dict) -> dict:
+    """Return a /api/session payload whose source flags match state.db truth.
+
+    WebUI-origin sidecars can carry stale CLI/import flags after older repair or
+    import paths touched the JSON file. The sidebar projection already trusts the
+    state.db source row for those sessions; the detail endpoint must do the same
+    or the frontend opens a WebUI-native transcript as an external session and
+    starts the destructive active-refresh reload loop.
+    """
+    if not isinstance(session, dict):
+        return session
+    if not _session_source_is_webui(state_meta):
+        return dict(session)
+
+    reconciled = dict(session)
+    reconciled["is_cli_session"] = False
+    reconciled["read_only"] = False
+    reconciled["source_tag"] = _safe_first(state_meta.get("source_tag"), "webui")
+    reconciled["raw_source"] = _safe_first(state_meta.get("raw_source"), "webui")
+    reconciled["session_source"] = _safe_first(state_meta.get("session_source"), "webui")
+    reconciled["source_label"] = _safe_first(state_meta.get("source_label"), "WebUI")
+    if state_meta.get("source"):
+        reconciled["source"] = state_meta["source"]
+
+    for key in ("message_count", "actual_message_count"):
+        if state_meta.get(key) is not None:
+            reconciled[key] = max(
+                _numeric_count(reconciled.get(key)),
+                _numeric_count(state_meta.get(key)),
+            )
+    for key in ("created_at", "updated_at", "last_message_at"):
+        if state_meta.get(key) is not None:
+            current = reconciled.get(key)
+            try:
+                reconciled[key] = max(float(current or 0), float(state_meta.get(key) or 0))
+            except (TypeError, ValueError):
+                reconciled[key] = state_meta[key]
+    return reconciled
+
+
 def _session_source_is_webui(session: dict) -> bool:
     """Return True for state.db/sidebar rows that describe WebUI-origin sessions."""
     if not isinstance(session, dict):
@@ -4666,6 +4869,8 @@ from api.workspace import (
     make_anchored_dir,
     validate_workspace_to_add,
     _is_blocked_system_path,
+    _home_path,
+    _is_within,
     _strip_surrounding_quotes,
     _is_remote_terminal_backend,
     _workspace_blocked_roots,
@@ -4775,6 +4980,91 @@ def _session_attention_summary(session_id: str) -> dict | None:
             "severity": "question",
         }
     return None
+
+
+_SIDEBAR_SESSION_RESPONSE_FIELDS = {
+    "session_id",
+    "title",
+    "display_title",
+    "_state_db_title",
+    "workspace",
+    "model",
+    "model_provider",
+    "message_count",
+    "user_message_count",
+    "created_at",
+    "updated_at",
+    "last_message_at",
+    "pinned",
+    "archived",
+    "project_id",
+    "profile",
+    "input_tokens",
+    "output_tokens",
+    "estimated_cost",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "cache_hit_percent",
+    "personality",
+    "context_length",
+    "config_context_length",
+    "window_usage_percent",
+    "source_tag",
+    "raw_source",
+    "session_source",
+    "source_label",
+    "is_cli_session",
+    "is_messaging_session",
+    "is_streaming",
+    "active_stream_id",
+    "has_pending_user_message",
+    "pending_started_at",
+    "default_hidden",
+    "worktree_path",
+    "worktree_branch",
+    "parent_session_id",
+    "parent_title",
+    "parent_source",
+    "relationship_type",
+    "pre_compression_snapshot",
+    "_lineage_root_id",
+    "_lineage_tip_id",
+    "_compression_segment_count",
+    "_lineage_collapsed_count",
+    "_parent_lineage_root_id",
+    "_cross_surface_child_session",
+    "match_type",
+    "match_preview",
+    # Preserved so the sidebar can suppress rename / action-menu / swipe on
+    # read-only (imported CLI + Claude Code) sessions, and render the detailed
+    # gateway model label. Dropping these silently regressed both surfaces.
+    # Only the latest `gateway_routing` is included (the sidebar label reader
+    # prefers it); the unbounded `gateway_routing_history` is intentionally NOT
+    # sent in the list payload to avoid per-row bloat.
+    "read_only",
+    "is_read_only",
+    "gateway_routing",
+}
+
+
+def _sidebar_session_response_item(session: dict, *, redact_enabled: bool | None = None) -> dict:
+    """Return the bounded /api/sessions row shape used by the sidebar.
+
+    Full session/detail fields such as messages, tool calls, compression
+    summaries, context-engine state, gateway routing history, drafts, and
+    pending user text are intentionally excluded from the list endpoint. Large
+    installs should not ship tens of KB of per-row detail just to render a
+    conversation title.
+    """
+    item = {
+        key: value
+        for key, value in dict(session).items()
+        if key in _SIDEBAR_SESSION_RESPONSE_FIELDS
+    }
+    if isinstance(item.get("title"), str):
+        item["title"] = _redact_text(item["title"], _enabled=redact_enabled)
+    item["attention"] = _session_attention_summary(str(item.get("session_id") or ""))
+    return item
 
 
 # ── Login page locale strings ─────────────────────────────────────────────────
@@ -6571,7 +6861,9 @@ def handle_get(handler, parsed) -> bool:
         return j(handler, get_available_models())
 
     if parsed.path == "/api/models/live":
-        return _handle_live_models(handler, parsed)
+        from api.profiles import profile_env_for_active_request
+        with profile_env_for_active_request("/api/models/live", logger_override=logger):
+            return _handle_live_models(handler, parsed)
 
     # ── Auxiliary models (GET/POST) ──
     if parsed.path == "/api/model/auxiliary":
@@ -6740,6 +7032,9 @@ def handle_get(handler, parsed) -> bool:
         try:
             _t1 = _time.monotonic()
             s = get_session(sid, metadata_only=(not load_messages))
+            _session_profile = getattr(s, 'profile', None) or None
+            if not _session_visible_to_active_profile(_session_profile, handler):
+                return bad(handler, "Session not found", 404)
             original_stream_id = getattr(s, "active_stream_id", None)
             _clear_stale_stream_state(s)
             cli_meta = _lookup_cli_session_metadata(sid) if _session_requires_cli_metadata_lookup(s) else {}
@@ -6747,7 +7042,6 @@ def handle_get(handler, parsed) -> bool:
             cli_messages = []
             state_db_messages = []
             metadata_summary = None
-            _session_profile = getattr(s, 'profile', None) or None
             if is_messaging_session:
                 cli_messages = get_cli_session_messages(sid)
             elif load_messages:
@@ -6951,7 +7245,9 @@ def handle_get(handler, parsed) -> bool:
                     float(raw.get("updated_at") or 0),
                     _merged_last_message_at,
                 )
-            if cli_meta and _is_messaging_session_record(cli_meta):
+            if cli_meta and _session_source_is_webui(cli_meta):
+                raw = _reconcile_session_detail_source_flags(raw, cli_meta)
+            elif cli_meta and _is_messaging_session_record(cli_meta):
                 raw = _merge_cli_sidebar_metadata(raw, cli_meta)
                 # ``message_count`` in /api/session is the display coordinate
                 # space used for pagination and the header badge. Messaging
@@ -7035,6 +7331,9 @@ def handle_get(handler, parsed) -> bool:
             if _was_webui_session:
                 return bad(handler, "Session not found", 404)
             cli_meta = _lookup_cli_session_metadata(sid)
+            _session_profile = (cli_meta or {}).get("profile") or None
+            if not _session_visible_to_active_profile(_session_profile, handler):
+                return bad(handler, "Session not found", 404)
             msgs = get_cli_session_messages(sid)
             if msgs:
                 sess = {
@@ -7153,7 +7452,7 @@ def handle_get(handler, parsed) -> bool:
                 diag=diag,
             )
             diag.stage("response_write")
-            return j(handler, _session_list_payload_to_response(payload))
+            return j(handler, _session_list_payload_to_response(payload), pretty=False)
         finally:
             diag.finish()
 
@@ -7827,8 +8126,27 @@ def handle_get(handler, parsed) -> bool:
     return False  # 404
 
 
-# ── GET route helpers
+# ── POST auth helpers
 
+def _require_passkey_registration_auth(handler) -> tuple[bool, str, int]:
+    """Require auth, or the existing local-only first-run bootstrap gate.
+
+    Registering additional passkeys is an auth-factor enrollment action and
+    requires a valid WebUI session.  The first passkey can still bootstrap a
+    passkey-only instance, but only through the same local/private-network
+    onboarding gate used for first password setup.
+    """
+    from api.auth import is_auth_enabled, parse_cookie, verify_session
+
+    auth_enabled = is_auth_enabled()
+    if not auth_enabled:
+        if _onboarding_gate_allows(handler, auth_enabled):
+            return True, "", 200
+        return False, "Authentication required", 401
+    cookie_val = parse_cookie(handler)
+    if not cookie_val or not verify_session(cookie_val):
+        return False, "Authentication required", 401
+    return True, "", 200
 
 def handle_post(handler, parsed) -> bool:
     """Handle all POST routes. Returns True if handled, False for 404."""
@@ -8118,7 +8436,8 @@ def handle_post(handler, parsed) -> bool:
 
     if parsed.path == "/api/default-model":
         try:
-            return j(handler, set_hermes_default_model(body.get("model")))
+            advanced = body.get("advanced") if isinstance(body, dict) else None
+            return j(handler, set_hermes_default_model(body.get("model"), advanced=advanced))
         except ValueError as e:
             return bad(handler, str(e))
         except RuntimeError as e:
@@ -8130,15 +8449,16 @@ def handle_post(handler, parsed) -> bool:
         task = str(body.get("task") or "").strip()
         provider = str(body.get("provider") or "auto").strip()
         model = str(body.get("model") or "").strip()
+        advanced = body.get("advanced") if isinstance(body, dict) else None
         if scope == "auxiliary":
             from api.config import set_auxiliary_model
             try:
-                return j(handler, set_auxiliary_model(task, provider, model))
+                return j(handler, set_auxiliary_model(task, provider, model, advanced=advanced))
             except Exception as exc:
                 return bad(handler, str(exc), status=400)
         if scope == "main":
             try:
-                return j(handler, set_hermes_default_model(model))
+                return j(handler, set_hermes_default_model(model, advanced=advanced))
             except ValueError as exc:
                 return bad(handler, str(exc), status=400)
         return bad(handler, f"unknown scope: {scope}", status=400)
@@ -9060,6 +9380,11 @@ def handle_post(handler, parsed) -> bool:
             # the old profile's cached model list (#1200 — profile-switch model bug).
             from api.config import invalidate_models_cache
             invalidate_models_cache()
+            try:
+                from api.gateway_watcher import restart_watcher_for_profile
+                restart_watcher_for_profile(name)
+            except Exception as exc:
+                logger.warning("Failed to restart gateway watcher for profile %s: %s", name, exc)
             return j(handler, result, extra_headers={
                 'Set-Cookie': build_profile_cookie(name, handler),
             })
@@ -9828,6 +10153,9 @@ def handle_post(handler, parsed) -> bool:
 
         if not _passkey_feature_flag_enabled():
             return j(handler, {"error": "Passkey support is disabled."}, status=404)
+        ok, error, status = _require_passkey_registration_auth(handler)
+        if not ok:
+            return j(handler, {"error": error}, status=status)
         try:
             return j(handler, {"ok": True, "publicKey": registration_options(handler)})
         except PasskeyRateLimitError as e:
@@ -9841,6 +10169,9 @@ def handle_post(handler, parsed) -> bool:
 
         if not _passkey_feature_flag_enabled():
             return j(handler, {"error": "Passkey support is disabled."}, status=404)
+        ok, error, status = _require_passkey_registration_auth(handler)
+        if not ok:
+            return j(handler, {"error": error}, status=status)
         try:
             result = finish_registration(body, handler)
             result["credentials"] = registered_credentials()
@@ -10079,6 +10410,9 @@ def _handle_session_export(handler, parsed):
     try:
         s = get_session(sid)
     except KeyError:
+        return bad(handler, "Session not found", 404)
+    active_profile = get_active_profile_name()
+    if not _profiles_match(getattr(s, "profile", None), active_profile):
         return bad(handler, "Session not found", 404)
     safe = redact_session_data(s.__dict__)
     payload = json.dumps(safe, ensure_ascii=False, indent=2)
@@ -10943,6 +11277,7 @@ def _handle_tts(handler, parsed):
     voice = "zh-CN-XiaoxiaoNeural"
     rate_str = ""
     pitch_str = ""
+    engine = "edge"  # "edge" | "elevenlabs" | "browser" (browser is client-side only)
 
     if handler.command != "POST":
         from api.helpers import bad as _bad
@@ -10954,6 +11289,7 @@ def _handle_tts(handler, parsed):
         voice = data.get("voice") or voice
         rate_str = _normalize_tts_prosody(data.get("rate"), unit="%")
         pitch_str = _normalize_tts_prosody(data.get("pitch"), unit="Hz")
+        engine = (data.get("engine") or "edge").strip().lower()
     except Exception:
         from api.helpers import bad as _bad
         return _bad(handler, "invalid request body", 400)
@@ -11026,6 +11362,90 @@ def _handle_tts(handler, parsed):
         from api.helpers import bad as _bad
         return _bad(handler, "rate limit exceeded — please wait", 429)
 
+    # ── ElevenLabs TTS ──────────────────────────────────────────────────
+    if engine == "elevenlabs":
+        api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+        if not api_key:
+            # Fall back to reading from Hermes .env file
+            try:
+                from api.onboarding import _load_env_file
+                from api.profiles import get_active_hermes_home
+                api_key = _load_env_file(get_active_hermes_home() / ".env").get("ELEVENLABS_API_KEY", "")
+            except Exception:
+                pass
+        if not api_key:
+            from api.helpers import bad as _bad
+            return _bad(handler, "ELEVENLABS_API_KEY not configured", 503)
+
+        # Resolve voice_id from Hermes config.yaml → env fallback
+        voice_id = "pNInz6obpgDQGcFmaJgB"  # Adam (same default as hermes-agent config.yaml)
+        model_id = "eleven_multilingual_v2"
+        try:
+            from api.config import get_config
+            tts_cfg = (get_config() or {}).get("tts", {})
+            if isinstance(tts_cfg, dict):
+                el_cfg = tts_cfg.get("elevenlabs", {})
+                if isinstance(el_cfg, dict):
+                    voice_id = el_cfg.get("voice_id", voice_id)
+                    model_id = el_cfg.get("model", model_id) or el_cfg.get("model_id", model_id)
+                    # ^ treat empty string as "not set" — fall through to default
+        except Exception:
+            pass  # fall back to defaults
+
+        # Validate voice_id is a safe path segment (no traversal)
+        # fullmatch (not match) so a trailing newline can't slip past the `$`
+        # anchor — defense-in-depth on the config-derived voice_id before it
+        # goes into the request URL (#3510 review).
+        if not re.fullmatch(r'[A-Za-z0-9_-]+', voice_id):
+            from api.helpers import bad as _bad
+            return _bad(handler, "invalid voice_id in config", 400)
+
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream?output_format=mp3_44100_128"
+        req_body = json.dumps({
+            "text": text,
+            "model_id": model_id,
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+        }).encode("utf-8")
+
+        from urllib.request import Request, urlopen as _urlopen
+
+        req = Request(url, data=req_body, headers={
+            "xi-api-key": api_key,
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg",
+        })
+
+        # Buffer the full response before sending first byte.
+        # The streaming endpoint is designed for chunked delivery, but urllib's
+        # chunked-read path adds per-chunk overhead that dominates short TTS
+        # payloads. With the 5000-char cap enforced above the buffer is bounded
+        # (a few MB of mp3 worst case), so full-buffer-then-send is faster in
+        # practice and simpler to reason about.
+        audio_data = b""
+        try:
+            with _urlopen(req, timeout=30) as resp:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    audio_data += chunk
+        except Exception:
+            logger.exception("ElevenLabs TTS generation failed")
+            from api.helpers import bad as _bad
+            return _bad(handler, "ElevenLabs TTS generation failed", 500)
+
+        handler.send_response(200)
+        handler.send_header("Content-Type", "audio/mpeg")
+        handler.send_header("Cache-Control", "no-store")
+        handler.send_header("Content-Length", str(len(audio_data)))
+        handler.end_headers()
+        try:
+            handler.wfile.write(audio_data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return True
+
+    # ── Edge TTS ────────────────────────────────────────────────────────
     allowed = {
         "zh-CN-XiaoxiaoNeural", "zh-CN-XiaoyiNeural", "zh-CN-YunxiNeural",
         "zh-CN-YunjianNeural", "zh-CN-YunyangNeural",
@@ -12221,6 +12641,23 @@ def _handle_live_models(handler, parsed):
                     _model_cfg = cfg.get("model", {})
                     _base_url = _model_cfg.get("base_url")
                     _api_key = _model_cfg.get("api_key")
+                # Fallback: try credential pool for base_url + api_key
+                if (not _base_url or not _api_key) and provider.startswith("custom:"):
+                    try:
+                        from api.config import _has_explicit_pool_credentials, _resolve_provider_alias
+                        if _has_explicit_pool_credentials(provider):
+                            from agent.credential_pool import load_pool as _lpool
+                            _resolved = _resolve_provider_alias(provider)
+                            _lm_pool = _lpool(_resolved)
+                            if _lm_pool:
+                                _lm_entry = _lm_pool.select()
+                                if _lm_entry:
+                                    if not _api_key:
+                                        _api_key = getattr(_lm_entry, "runtime_api_key", "") or ""
+                                    if not _base_url:
+                                        _base_url = str(getattr(_lm_entry, "base_url", "") or "").strip()
+                    except ImportError:
+                        pass
                 if _base_url and _api_key:
                     try:
                         import urllib.request
@@ -12312,14 +12749,11 @@ def _handle_live_models(handler, parsed):
         if not ids:
             return _finish({"provider": provider, "models": [], "count": 0})
 
-        # For Nous Portal, apply the same featured-set cap that
-        # /api/models uses so background enrichment via _fetchLiveModels()
-        # doesn't undo the dropdown trim — otherwise a 397-model catalog
-        # would still flood the picker after the initial render finished
-        # the cap. The full list is returned via the main /api/models
-        # endpoint's extra_models field for /model autocomplete; the live
-        # endpoint is purely a dropdown-enrichment surface, so it should
-        # match the dropdown's visibility budget. (#1567)
+        # Match the same dropdown visibility budget that /api/models uses so
+        # background enrichment via _fetchLiveModels() does not re-append an
+        # uncapped catalog after the initial picker render. The full catalog
+        # still comes from /api/models via extra_models for search/show-all;
+        # this endpoint is only a dropdown-enrichment surface. (#1567, #3691)
         if provider == "nous":
             try:
                 from api.config import _build_nous_featured_set
@@ -12328,6 +12762,10 @@ def _handle_live_models(handler, parsed):
                 ids = _featured
             except Exception:
                 logger.debug("Failed to apply Nous featured-set cap for /api/models/live")
+        else:
+            from api.config import _MODEL_PICKER_OVERFLOW_THRESHOLD, _MODEL_PICKER_VISIBLE_TARGET
+            if len(ids) > _MODEL_PICKER_OVERFLOW_THRESHOLD:
+                ids = ids[:_MODEL_PICKER_VISIBLE_TARGET]
 
         # Normalise to {id, label} — provider_model_ids() returns plain string IDs.
         # For ollama-cloud use the shared Ollama formatter (handles `:variant` suffix).
@@ -12596,6 +13034,7 @@ def _handle_cron_recent(handler, parsed):
         jobs = list_jobs(include_disabled=True)
         completions = []
         for job in jobs:
+            job_id = str(job.get("id", "") or "")
             last_run = job.get("last_run_at")
             if not last_run:
                 continue
@@ -12611,13 +13050,22 @@ def _handle_cron_recent(handler, parsed):
             if ts > since:
                 completions.append(
                     {
-                        "job_id": job.get("id", ""),
+                        "job_id": job_id,
                         "name": job.get("name", "Unknown"),
                         "status": job.get("last_status", "unknown"),
                         "completed_at": ts,
                         "toast_notifications": job.get("toast_notifications") is not False,
                     }
                 )
+        latest_session_info = _latest_cron_session_info_for_jobs(
+            [job.get("id", "") for job in jobs],
+            [c["job_id"] for c in completions],
+        )
+        for completion in completions:
+            info = latest_session_info.get(str(completion.get("job_id", "") or ""), {})
+            completion["session_id"] = str(info.get("session_id", "") or "")
+            if info.get("message_count") is not None:
+                completion["message_count"] = int(info["message_count"])
         return j(handler, {"completions": completions, "since": since})
     except ImportError:
         return j(handler, {"completions": [], "since": since})
@@ -14108,6 +14556,7 @@ def _handle_chat_sync(handler, body):
         _next_context_messages = _dedupe_replayed_context_messages(
             _previous_context_messages,
             _next_context_messages,
+            msg,
         )
         s.context_messages = _next_context_messages
         s.messages = _merge_display_messages_after_agent_result(
@@ -15203,9 +15652,23 @@ def _handle_workspace_add(handler, body):
     # _is_blocked_system_path honours user-tmp carve-outs (e.g. /var/folders on
     # macOS) so pytest's tmp_path_factory paths and other legit user-tmp dirs
     # still register cleanly.
-    candidate = Path(path_str).expanduser().resolve()
+    try:
+        candidate = Path(path_str).expanduser().resolve()
+    except (ValueError, OSError, RuntimeError) as e:
+        # Invalid path (e.g. embedded null byte) — fail closed with a clean 400
+        # instead of letting .resolve() raise an uncaught 500.
+        return bad(handler, f"Invalid path: {_sanitize_error(e)}")
     if _is_blocked_system_path(candidate):
-        return bad(handler, f"Path points to a system directory: {candidate}")
+        # Home-directory carve-out, mirroring the validators
+        # (resolve_trusted_workspace / validate_workspace_to_add): a workspace
+        # at or under the active user's home must stay allowed even when that
+        # home lives under an otherwise-blocked root (e.g. systemd-homed
+        # /var/home/<user>/...). Without this the route rejects valid
+        # /var/home workspaces before validate_workspace_to_add()'s carve-out
+        # can run.
+        _home = _home_path()
+        if not (_home != Path("/") and (candidate == _home or _is_within(candidate, _home))):
+            return bad(handler, f"Path points to a system directory: {candidate}")
     # Now safe to create the directory if requested
     if auto_create:
         try:
@@ -15380,6 +15843,31 @@ def _handle_approval_respond(handler, body):
     if choice not in ("once", "session", "always", "deny"):
         return bad(handler, f"Invalid choice: {choice}")
     approval_id = body.get("approval_id", "")
+
+    # Gateway relay: forward choice to the runs API when session has an active run.
+    try:
+        from api.gateway_chat import _STREAM_RUN_IDS, _gateway_base_url, _gateway_api_key
+        from api.config import get_config as _get_config
+        s = get_session(sid)
+        _run_id = None
+        if s is not None:
+            active_sid = getattr(s, "active_stream_id", None)
+            if active_sid:
+                _run_id = _STREAM_RUN_IDS.get(active_sid)
+        if _run_id:
+            if not approval_id:
+                return bad(handler, "approval_id is required for gateway approvals")
+            from api.runner_client import HttpRunnerClient, RunnerClientError
+            _cfg = _get_config()
+            _base = _gateway_base_url(_cfg)
+            _key = _gateway_api_key()
+            try:
+                HttpRunnerClient(base_url=_base, api_key=_key).respond_approval(_run_id, approval_id, choice)
+            except (RunnerClientError, ValueError) as exc:
+                return j(handler, {"ok": False, "choice": choice, "relayed": True, "error": str(exc)}, status=502)
+            return j(handler, {"ok": True, "choice": choice, "relayed": True})
+    except Exception:
+        pass  # fall through to local approval path
 
     from api.runtime_adapter import LegacyJournalRuntimeAdapter, runtime_adapter_enabled
 
@@ -16715,21 +17203,21 @@ def _handle_memory_write(handler, body):
     except ImportError:
         home = Path.home() / ".hermes"
         mem_dir = home / "memories"
+    mem_dir.mkdir(parents=True, exist_ok=True)
     section = body["section"]
     if section == "memory":
-        if mem_dir.is_symlink():
-            return bad(handler, "Cannot write through a symlinked memories directory")
-        mem_dir.mkdir(parents=True, exist_ok=True)
         target = mem_dir / "MEMORY.md"
     elif section == "user":
-        if mem_dir.is_symlink():
-            return bad(handler, "Cannot write through a symlinked memories directory")
-        mem_dir.mkdir(parents=True, exist_ok=True)
         target = mem_dir / "USER.md"
     elif section == "soul":
         target = home / "SOUL.md"
     else:
         return bad(handler, 'section must be "memory", "user", or "soul"')
+    # Refuse to write through a symlinked target file: a symlink planted at the
+    # memory path (e.g. via a restored/imported workspace) would otherwise let a
+    # memory write clobber an arbitrary file outside the memories directory. This
+    # mirrors the symlink-rejection hardening already shipped for skills/plugins
+    # (#4217/#4234/#4240).
     if target.is_symlink():
         return bad(handler, "Cannot write to a symlinked memory file")
     target.write_text(body["content"], encoding="utf-8")
@@ -16821,17 +17309,39 @@ def _handle_session_import_cli(handler, body):
         return bad(handler, str(e))
 
     sid = str(body["session_id"])
+    requested_profile = _normalize_import_profile_value((body or {}).get("profile"))
+    if requested_profile == "":
+        return bad(handler, "invalid profile", 400)
+    allow_all_profiles = _request_wants_all_profiles_import(body)
+    if allow_all_profiles and not requested_profile:
+        return bad(handler, "profile is required for all_profiles import", 400)
 
     # Check if already imported — refresh messages from CLI store if new ones arrived
     existing = Session.load(sid)
     if existing:
-        fresh_msgs = get_cli_session_messages(sid)
+        # Cross-profile boundary: an unqualified (non-all-profiles) request must not
+        # read or refresh a session that belongs to another profile, even though the
+        # WebUI session store (SESSION_DIR) is a single global directory. This mirrors
+        # the /api/session detail and /api/session/export profile-scoping gates.
+        # An explicit all_profiles import is still allowed, but only when the request's
+        # profile matches the stored session's profile.
+        existing_profile = getattr(existing, "profile", None)
+        if allow_all_profiles:
+            if requested_profile and not _profiles_match(existing_profile, requested_profile):
+                return bad(handler, "Session not found in CLI store", 404)
+        elif not _session_visible_to_active_profile(existing_profile, handler):
+            return bad(handler, "Session not found in CLI store", 404)
+        refresh_profile = requested_profile or existing_profile
+        cli_meta = _resolve_cli_import_metadata(
+            sid,
+            requested_profile=refresh_profile,
+            allow_all_profiles=allow_all_profiles,
+        )
+        fresh_msgs = get_cli_session_messages(
+            sid,
+            profile=(cli_meta or {}).get("profile") or refresh_profile,
+        )
         changed = False
-        cli_meta = None
-        for cs in list(get_cli_sessions()):
-            if cs["session_id"] == sid:
-                cli_meta = cs
-                break
         if fresh_msgs and len(fresh_msgs) > len(existing.messages):
             # Prefix-equality guard: only extend if existing messages are a prefix of
             # the fresh CLI messages. Prevents silently dropping WebUI-added messages
@@ -16877,48 +17387,33 @@ def _handle_session_import_cli(handler, body):
         )
 
     # Fetch messages from CLI store
-    msgs = get_cli_session_messages(sid)
+    cli_meta = _resolve_cli_import_metadata(
+        sid,
+        requested_profile=requested_profile,
+        allow_all_profiles=allow_all_profiles,
+    )
+    profile = cli_meta.get("profile") if cli_meta else (requested_profile if allow_all_profiles else None)
+    msgs = get_cli_session_messages(sid, profile=profile)
     if not msgs:
         return bad(handler, "Session not found in CLI store", 404)
 
     # Get profile, model, timestamps, and title from CLI session metadata
-    profile = None
-    created_at = None
-    updated_at = None
-    cli_title = None
-    cli_source_tag = None
-    model = "unknown"
-    cli_raw_source = None
-    cli_session_source = None
-    cli_source_label = None
-    cli_user_id = None
-    cli_chat_id = None
-    cli_chat_type = None
-    cli_thread_id = None
-    cli_session_key = None
-    cli_platform = None
-    cli_parent_session_id = None
-    cli_read_only = False
-    for cs in get_cli_sessions():
-        if cs["session_id"] == sid:
-            profile = cs.get("profile")
-            model = cs.get("model", "unknown")
-            created_at = cs.get("created_at")
-            updated_at = cs.get("updated_at")
-            cli_title = cs.get("title")
-            cli_source_tag = cs.get("source_tag")
-            cli_raw_source = cs.get("raw_source")
-            cli_session_source = cs.get("session_source")
-            cli_source_label = cs.get("source_label")
-            cli_user_id = cs.get("user_id")
-            cli_chat_id = cs.get("chat_id")
-            cli_chat_type = cs.get("chat_type")
-            cli_thread_id = cs.get("thread_id")
-            cli_session_key = cs.get("session_key")
-            cli_platform = cs.get("platform")
-            cli_parent_session_id = cs.get("parent_session_id")
-            cli_read_only = bool(cs.get("read_only"))
-            break
+    created_at = cli_meta.get("created_at") if cli_meta else None
+    updated_at = cli_meta.get("updated_at") if cli_meta else None
+    cli_title = cli_meta.get("title") if cli_meta else None
+    cli_source_tag = cli_meta.get("source_tag") if cli_meta else None
+    model = cli_meta.get("model", "unknown") if cli_meta else "unknown"
+    cli_raw_source = cli_meta.get("raw_source") if cli_meta else None
+    cli_session_source = cli_meta.get("session_source") if cli_meta else None
+    cli_source_label = cli_meta.get("source_label") if cli_meta else None
+    cli_user_id = cli_meta.get("user_id") if cli_meta else None
+    cli_chat_id = cli_meta.get("chat_id") if cli_meta else None
+    cli_chat_type = cli_meta.get("chat_type") if cli_meta else None
+    cli_thread_id = cli_meta.get("thread_id") if cli_meta else None
+    cli_session_key = cli_meta.get("session_key") if cli_meta else None
+    cli_platform = cli_meta.get("platform") if cli_meta else None
+    cli_parent_session_id = cli_meta.get("parent_session_id") if cli_meta else None
+    cli_read_only = bool((cli_meta or {}).get("read_only"))
 
     # Use the CLI session title if available (e.g., cron job name), otherwise derive from messages
     title = cli_title or title_from(msgs, "CLI Session")

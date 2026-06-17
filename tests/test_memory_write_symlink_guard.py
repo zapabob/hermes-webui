@@ -1,3 +1,16 @@
+"""Regression test for the memory-write symlinked-target guard (#4242).
+
+`_handle_memory_write` refuses to write through a symlinked target file so a
+symlink planted at MEMORY.md / USER.md / SOUL.md (e.g. via a restored or imported
+workspace) cannot redirect a memory write to clobber an arbitrary file. This
+mirrors the symlink-rejection hardening shipped for skills/plugins
+(#4217/#4234/#4240).
+
+Per maintainer decision, a symlinked *parent memories directory* is deliberately
+NOT rejected here (symlinking the whole .hermes/memories dir is a legitimate
+setup); only the concrete target file is guarded.
+"""
+
 import os
 
 import pytest
@@ -43,30 +56,32 @@ def test_memory_write_rejects_symlinked_memory_file(tmp_path, monkeypatch):
     assert "bad" in cap, f"expected 400, got {cap}"
     assert cap["bad"][1] == 400
     assert "Cannot write to a symlinked memory file" in cap["bad"][0]
+    # The symlink target outside the memories dir must be untouched.
     assert outside.read_text(encoding="utf-8") == "important"
 
 
-def test_memory_write_rejects_symlinked_memories_directory(tmp_path, monkeypatch):
+def test_memory_write_allows_symlinked_memories_directory(tmp_path, monkeypatch):
+    """A symlinked parent memories directory is allowed (deliberate decision) as
+    long as the concrete target file itself is not a symlink."""
     home = tmp_path / "home"
     home.mkdir()
-    outside_dir = tmp_path / "outside-memories"
-    outside_dir.mkdir()
+    real_dir = tmp_path / "real-memories"
+    real_dir.mkdir()
     link = home / "memories"
     try:
-        os.symlink(str(outside_dir), str(link), target_is_directory=True)
+        os.symlink(str(real_dir), str(link), target_is_directory=True)
     except (OSError, NotImplementedError):
         pytest.skip("platform does not support symlinks")
 
     cap = _patch_memory_routes(monkeypatch, home)
     routes._handle_memory_write(
         _FakeHandler(),
-        {"section": "user", "content": "changed"},
+        {"section": "user", "content": "# User\n"},
     )
 
-    assert "bad" in cap, f"expected 400, got {cap}"
-    assert cap["bad"][1] == 400
-    assert "Cannot write through a symlinked memories directory" in cap["bad"][0]
-    assert not (outside_dir / "USER.md").exists()
+    assert "ok" in cap, f"expected success, got {cap}"
+    assert cap["ok"]["ok"] is True
+    assert (real_dir / "USER.md").read_text(encoding="utf-8") == "# User\n"
 
 
 def test_memory_write_real_file_still_works(tmp_path, monkeypatch):
