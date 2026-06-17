@@ -7,6 +7,7 @@
 - Add scripts/merge_official_updates.py for repeatable official upstream fetch/merge runs while preserving local commits.
 - Highlight this fork's local upstream-merge, OpenClaw/OpenCode, and native Windows wrapper differences in README.md.
 - Native Windows wrapper now injects HERMES_WEBUI_PASSWORD at launch from the process environment, HERMES_WEBUI_PASSWORD_FILE, HERMES_HOME\.env, or the legacy WebUI .env, and can open the browser with -Open or HERMES_WEBUI_OPEN_ON_START=1.
+- **Irodori TTS** is now selectable as a server-side TTS engine in Settings → Preferences. It calls a local OpenAI-compatible `/v1/audio/speech` endpoint using `IRODORI_TTS_BASE_URL`, optional `IRODORI_API_KEY`, and `tts.irodori` / `tts.provider: irodori` settings from the Hermes agent config.
 
 ### Changed
 
