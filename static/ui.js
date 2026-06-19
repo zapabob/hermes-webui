@@ -5,7 +5,7 @@
 // legacy reverse-scan over S.messages — that keeps new clients working
 // against old servers (Phase 1 may not yet be deployed everywhere).
 // See api/todo_state.py for the wire contract.
-const S={session:null,messages:[],entries:[],busy:false,pendingFiles:[],toolCalls:[],activeStreamId:null,currentDir:'.',activeProfile:'default',activeProfileIsDefault:true,showHiddenWorkspaceFiles:false,todos:[],todoStateMeta:null};
+const S={session:null,messages:[],entries:[],busy:false,pendingFiles:[],toolCalls:[],activeStreamId:null,currentDir:'.',activeProfile:'default',activeProfileIsDefault:true,showHiddenWorkspaceFiles:false,todos:[],todoStateMeta:null,_pendingSessionToolsets:null};
 
 function assistantDisplayName(){
   if(S.activeProfile&&S.activeProfile!=='default') return S.activeProfile.charAt(0).toUpperCase()+S.activeProfile.slice(1);
@@ -376,7 +376,17 @@ function _statusCardHtml(card){
 const MESSAGE_RENDER_WINDOW_DEFAULT=50;
 const MESSAGE_VIRTUAL_THRESHOLD_ROWS=80;
 const MESSAGE_VIRTUAL_BUFFER_PX=900;
-const MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHT=140;
+const MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS={
+  user:120,
+  assistant:160,
+  tool_call:400,
+  default:140,
+};
+function _messageVirtualDefaultHeightForRole(role){
+  return MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS[
+    role&&Object.prototype.hasOwnProperty.call(MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS,role)?role:'default'
+  ];
+}
 const MESSAGE_VIRTUAL_MEASUREMENT_MAX_RERENDERS=2;
 let _messageRenderWindowSid=null;
 let _messageRenderWindowSize=MESSAGE_RENDER_WINDOW_DEFAULT;
@@ -384,11 +394,26 @@ let _messageVirtualHeightCache=[];
 let _messageVirtualHeightCacheEntries=[];
 let _messageVirtualHeightCacheLen=0;
 let _messageVirtualHeightCacheSrc=null;
-let _messageVirtualEstimatedRowHeight=MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHT;
+let _messageVirtualEstimatedRowHeight=_messageVirtualDefaultHeightForRole('default');
 let _messageVirtualScrollRaf=0;
 let _messageVirtualWindowKey='';
 let _messageVirtualMeasurementCycleKey='';
 let _messageVirtualMeasurementRetryCount=0;
+let _messageVirtualScrollActive=false;
+let _messageVirtualScrollSettleTimer=0;
+let _messageVirtualDeferredMeasurement=null;
+function _markMessageVirtualScrollActive(){
+  _messageVirtualScrollActive=true;
+  clearTimeout(_messageVirtualScrollSettleTimer);
+  _messageVirtualScrollSettleTimer=setTimeout(()=>{
+    _messageVirtualScrollActive=false;
+    if(_messageVirtualDeferredMeasurement){
+      const deferred=_messageVirtualDeferredMeasurement;
+      _messageVirtualDeferredMeasurement=null;
+      _scheduleMessageVirtualMeasurementRefresh(deferred);
+    }
+  },150);
+}
 // Cached visWithIdx array — invalidated when S.messages.length changes.
 let _visWithIdxCache=null;
 let _visWithIdxCacheLen=0;
@@ -403,10 +428,14 @@ function _clearMessageVirtualHeightCache(){
   _messageVirtualHeightCacheEntries=[];
   _messageVirtualHeightCacheLen=0;
   _messageVirtualHeightCacheSrc=null;
-  _messageVirtualEstimatedRowHeight=MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHT;
+  _messageVirtualEstimatedRowHeight=_messageVirtualDefaultHeightForRole('default');
   _messageVirtualWindowKey='';
   _messageVirtualMeasurementCycleKey='';
   _messageVirtualMeasurementRetryCount=0;
+  _messageVirtualScrollActive=false;
+  clearTimeout(_messageVirtualScrollSettleTimer);
+  _messageVirtualScrollSettleTimer=0;
+  _messageVirtualDeferredMeasurement=null;
 }
 function _resetMessageRenderWindow(sid){
   _messageRenderWindowSid=sid||null;
@@ -424,6 +453,7 @@ function _cancelMessageVirtualizedRender(){
 }
 function _messageIsRenderable(m){
   if(!m||!m.role||m.role==='tool') return false;
+  if(m._source === 'process_wakeup') return false;
   if(_isContextCompactionMessage(m)||_isPreservedCompressionTaskListMessage(m)) return false;
   if(_isRecoveryControlMessage(m)) return false;
   const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
@@ -450,15 +480,17 @@ function _getVisibleMessagesWithIdx(){
 function _messageVirtualWindow(opts){
   const total=Math.max(0, Number(opts&&opts.total)||0);
   const threshold=Math.max(1, Number(opts&&opts.threshold)||MESSAGE_VIRTUAL_THRESHOLD_ROWS);
-  const defaultHeight=Math.max(1, Number(opts&&opts.defaultHeight)||MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHT);
+  const defaultHeight=Math.max(1, Number(opts&&opts.defaultHeight)||_messageVirtualDefaultHeightForRole('default'));
   const bufferPx=Math.max(0, Number(opts&&opts.bufferPx)||MESSAGE_VIRTUAL_BUFFER_PX);
   const viewportHeight=Math.max(defaultHeight, Number(opts&&opts.viewportHeight)||defaultHeight*6);
   const keepTailCount=Math.max(0, Number(opts&&opts.keepTailCount)||0);
   const tailStart=Math.max(0, total-keepTailCount);
   const heights=Array.isArray(opts&&opts.heights)?opts.heights:[];
+  const roleForIdx=typeof (opts&&opts.roleForIdx)==='function'?opts.roleForIdx:null;
   const rowHeightFor=(idx)=>{
     const cached=Number(heights[idx]);
-    return Number.isFinite(cached)&&cached>0?cached:defaultHeight;
+    if(Number.isFinite(cached)&&cached>0) return cached;
+    return roleForIdx?Math.max(1,_messageVirtualDefaultHeightForRole(roleForIdx(idx))):defaultHeight;
   };
   if(total<=Math.max(threshold, keepTailCount)){
     return {virtualized:false,start:0,end:total,topPad:0,bottomPad:0,total,tailStart};
@@ -524,6 +556,10 @@ function _messageVirtualMeasurementCycleKeyFor(windowMetrics){
   ].join(':');
 }
 function _scheduleMessageVirtualMeasurementRefresh(windowMetrics){
+  if(_messageVirtualScrollActive){
+    _messageVirtualDeferredMeasurement=windowMetrics;
+    return;
+  }
   const cycleKey=_messageVirtualMeasurementCycleKeyFor(windowMetrics);
   if(_messageVirtualMeasurementCycleKey!==cycleKey){
     _messageVirtualMeasurementCycleKey=cycleKey;
@@ -609,6 +645,19 @@ function _syncMessageVirtualHeightCache(visWithIdx){
   _messageVirtualHeightCacheLen=S.messages.length;
   _messageVirtualHeightCacheSrc=S.messages;
 }
+function _messageVirtualRoleForEntry(entry){
+  const m=entry&&entry.m;
+  if(!m) return 'default';
+  if(m.role==='user') return 'user';
+  if(m.role==='assistant'){
+    if((Array.isArray(m.tool_calls)&&m.tool_calls.length>0)||
+       (Array.isArray(m.content)&&m.content.some(p=>p&&p.type==='tool_use'))||
+       (Array.isArray(m._partial_tool_calls)&&m._partial_tool_calls.length>0))
+      return 'tool_call';
+    return 'assistant';
+  }
+  return 'default';
+}
 function _currentMessageVirtualWindow(visWithIdx, keepTailCount){
   _syncMessageVirtualHeightCache(visWithIdx);
   const container=$('messages');
@@ -627,6 +676,7 @@ function _currentMessageVirtualWindow(visWithIdx, keepTailCount){
     viewportHeight:container?container.clientHeight:(_messageVirtualEstimatedRowHeight*6),
     heights:_messageVirtualHeightCache,
     defaultHeight:_messageVirtualEstimatedRowHeight,
+    roleForIdx:idx=>_messageVirtualRoleForEntry(visWithIdx[idx]),
     keepTailCount,
   });
 }
@@ -640,7 +690,7 @@ function _messageVirtualPrependedHeightDelta(prependedRenderableCount){
   let total=0;
   for(let i=0;i<limit;i++){
     const cached=Number(_messageVirtualHeightCache[i]);
-    total+=(Number.isFinite(cached)&&cached>0)?cached:_messageVirtualEstimatedRowHeight;
+    total+=(Number.isFinite(cached)&&cached>0)?cached:_messageVirtualDefaultHeightForRole(_messageVirtualRoleForEntry(visWithIdx[i]));
   }
   return Math.max(0,Math.round(total));
 }
@@ -658,7 +708,7 @@ function _messageVirtualScrollTopForVisibleIdx(visWithIdx, visibleIdx, container
   let offset=0;
   for(let i=0;i<limit;i++){
     const cached=Number(_messageVirtualHeightCache[i]);
-    offset+=(Number.isFinite(cached)&&cached>0)?cached:_messageVirtualEstimatedRowHeight;
+    offset+=(Number.isFinite(cached)&&cached>0)?cached:_messageVirtualDefaultHeightForRole(_messageVirtualRoleForEntry(visWithIdx[i]));
   }
   const viewport=container?Math.max(0,Number(container.clientHeight)||0):0;
   return Math.max(0,Math.round(offset-(viewport*0.35)));
@@ -695,6 +745,29 @@ function _restoreMessageViewportAnchor(anchor, rawIdxDelta){
   container.scrollTop+=(rect.top-containerRect.top)-targetTop;
   requestAnimationFrame(()=>{ _programmaticScroll=false; });
   return true;
+}
+function _compensateScrollForMeasurementDelta(renderFn){
+  const container=$('messages');
+  if(!container) return renderFn();
+  const anchorBefore=_captureMessageViewportAnchor();
+  const scrollTopBefore=container.scrollTop;
+  renderFn();
+  if(!anchorBefore) return;
+  if(scrollTopBefore<1){
+    const spacer=container.querySelector('[data-virtual-spacer="before"]');
+    if(!spacer||parseFloat(spacer.style.height||'0')<=0) return;
+  }
+  const row=container.querySelector(`[data-msg-idx="${anchorBefore.rawIdx}"]`);
+  if(!row) return;
+  const containerRect=container.getBoundingClientRect();
+  const rowRect=row.getBoundingClientRect();
+  const actualOffset=rowRect.top-containerRect.top;
+  const delta=actualOffset-anchorBefore.topOffset;
+  if(Math.abs(delta)<2) return;
+  _programmaticScroll=true;
+  container.scrollTop=scrollTopBefore+delta;
+  _lastScrollTop=container.scrollTop;
+  requestAnimationFrame(()=>{ setTimeout(()=>{ _programmaticScroll=false; },0); });
 }
 function _messageViewportIntersectsRenderedRow(){
   const container=$('messages');
@@ -771,7 +844,7 @@ function _scheduleMessageVirtualizedRender(force){
     const liveWindow=_currentMessageVirtualWindow(liveVisWithIdx,_messageVirtualKeepTailCount());
     const liveKey=_messageVirtualWindowKeyFor(liveWindow);
     if(!force&&liveKey===_messageVirtualWindowKey) return;
-    renderMessages({ preserveScroll:true });
+    _compensateScrollForMeasurementDelta(()=>{ renderMessages({ preserveScroll:true }); });
   });
 }
 
@@ -2228,6 +2301,13 @@ function renderModelDropdown(){
     }
     return _groupMeta.get(groupKey);
   };
+  const _vendorPrefix=(rawId)=>{
+    const stripped=String(rawId||'').replace(/^@([^:]+:)+/,'');
+    const slash=stripped.indexOf('/');
+    return slash>0?stripped.slice(0,slash):'';
+  };
+  const SUB_GROUP_PROVIDERS=new Set(['openrouter','nous']);
+  const SUB_GROUP_MIN_MODELS=8;
   for(const child of Array.from(sel.children)){
     if(child.tagName==='OPTGROUP'){
       const providerId=child.dataset&&child.dataset.provider?child.dataset.provider:'';
@@ -2447,6 +2527,17 @@ function renderModelDropdown(){
     const _hit=_modelData.find(m=>m&&!m.endpointErrorOnly&&String(m.value||'')===_selVal);
     return _hit?_hit.groupKey:null;
   })();
+  const _makeModelRow=(m,sel,shouldRenderHeading)=>{
+    const row=document.createElement('div');
+    row.className='model-opt'+(m.value===sel.value?' active':'');
+    const badgeHtml=m.badge?`<span class="model-opt-badge model-opt-badge--${esc(m.badge.role||'configured')}">${esc(m.badge.label||'Configured')}</span>`:'';
+    const _plainGroup=m.group?String(m.group).replace(/\s*\(\d+\s+of\s+\d+\)\s*$/,''):'';
+    const _underOwnHeading=shouldRenderHeading&&!!(m.groupKey&&_groupWrappers[m.groupKey]);
+    const providerChip=(_plainGroup&&!_underOwnHeading)?`<span class="model-opt-provider">${esc(_plainGroup)}</span>`:'';
+    row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(m.name)}</span>${badgeHtml}${providerChip}</div><span class="model-opt-id">${esc(m.id)}</span>`;
+    row.onclick=()=>selectModelFromDropdown(m.value,m.providerId||(m.badge&&m.badge.provider)||null);
+    return row;
+  };
   const _filterModels=(term)=>{
     term=term.trim().toLowerCase();
     const hasSearch=!!term;
@@ -2600,30 +2691,55 @@ function renderModelDropdown(){
           if(closed) _forceOpenGroups.add(groupKey); else _forceOpenGroups.delete(groupKey);
           heading.classList.toggle('open',closed);
         });
-      }
-      for(const m of groupRows){
-        const row=document.createElement('div');
-        row.className='model-opt'+(m.value===sel.value?' active':'');
-        const badgeHtml=m.badge?`<span class="model-opt-badge model-opt-badge--${esc(m.badge.role||'configured')}">${esc(m.badge.label||'Configured')}</span>`:'';
-        // The group heading carries the overflow count ("Provider (15 of 30)"); the
-        // per-row provider chip must show the PLAIN provider label only — otherwise
-        // the count is stamped redundantly on every row and reads as nonsense after
-        // "Show all" expands the group (e.g. row 30 still showing "(15 of 30)"). (#3691)
-        const _plainGroup=m.group?String(m.group).replace(/\s*\(\d+\s+of\s+\d+\)\s*$/,''):'';
-        // Only show the per-row provider chip when the row is NOT already under its
-        // own provider heading — i.e. it's a flat/hoisted row appended straight to
-        // the dropdown (no group wrapper). Repeating the provider name on every row
-        // beneath its own "PROVIDER" heading is pure visual noise. The chip still
-        // orients hoisted/configured rows and search results that render flat.
-        const _underOwnHeading=shouldRenderHeading&&!!(m.groupKey&&_groupWrappers[m.groupKey]);
-        const providerChip=(_plainGroup&&!_underOwnHeading)?`<span class="model-opt-provider">${esc(_plainGroup)}</span>`:'';
-        row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(m.name)}</span>${badgeHtml}${providerChip}</div><span class="model-opt-id">${esc(m.id)}</span>`;
-        row.onclick=()=>selectModelFromDropdown(m.value,m.providerId||(m.badge&&m.badge.provider)||null);
-        if(m.groupKey&&_groupWrappers[m.groupKey]){
-          _groupWrappers[m.groupKey].appendChild(row);
-        }else{
-          dd.appendChild(row);
+        const useSubGroups=(
+          SUB_GROUP_PROVIDERS.has(meta.providerId) &&
+          groupRows.length>=SUB_GROUP_MIN_MODELS
+        );
+        if(useSubGroups){
+          const byPrefix=new Map();
+          for(const m of groupRows){
+            const pfx=_vendorPrefix(m.value)||'other';
+            if(!byPrefix.has(pfx)) byPrefix.set(pfx,[]);
+            byPrefix.get(pfx).push(m);
+          }
+          const sorted=[...byPrefix.entries()].sort((a,b)=>{
+            if(a[0]==='other') return 1;
+            if(b[0]==='other') return -1;
+            return b[1].length-a[1].length;
+          });
+          for(const [pfx,pfxRows] of sorted){
+            if(pfxRows.length>=2){
+              const subKey=`${groupKey}::${pfx}`;
+              if(!(subKey in _groupOpenState)) _groupOpenState[subKey]=true;
+              if(hasSearch) _groupOpenState[subKey]=true;
+              const subHeading=document.createElement('div');
+              subHeading.className='model-group sub collapsible';
+              subHeading.dataset.group=subKey;
+              if(_groupOpenState[subKey]) subHeading.classList.add('open');
+              subHeading.textContent=pfx;
+              const subWrapper=document.createElement('div');
+              subWrapper.className='model-group-body sub';
+              subWrapper.dataset.group=subKey;
+              if(!_groupOpenState[subKey]) subWrapper.style.display='none';
+              subHeading.addEventListener('click',(e)=>{
+                e.stopPropagation();
+                const closed=subWrapper.style.display==='none';
+                subWrapper.style.display=closed?'':'none';
+                _groupOpenState[subKey]=closed;
+                subHeading.classList.toggle('open',closed);
+              });
+              wrapper.appendChild(subHeading);
+              wrapper.appendChild(subWrapper);
+              for(const m of pfxRows) subWrapper.appendChild(_makeModelRow(m,sel,shouldRenderHeading));
+            } else {
+              for(const m of pfxRows) wrapper.appendChild(_makeModelRow(m,sel,shouldRenderHeading));
+            }
+          }
+        } else {
+          for(const m of groupRows) wrapper.appendChild(_makeModelRow(m,sel,shouldRenderHeading));
         }
+      } else {
+        for(const m of groupRows) dd.appendChild(_makeModelRow(m,sel,shouldRenderHeading));
       }
       if(!term&&hiddenCount){
         const showAll=document.createElement('div');
@@ -2665,7 +2781,14 @@ function renderModelDropdown(){
   };
   _si.addEventListener('input',()=>_filterModels(_si.value));
   // Keyboard navigation through filtered model rows (#2791).
-  const _visibleModelRows=()=>Array.from(dd.querySelectorAll('.model-opt,.model-opt-more')).filter(el=>!el.closest('.model-group-body')||el.closest('.model-group-body').style.display!=='none');
+  const _visibleModelRows=()=>Array.from(dd.querySelectorAll('.model-opt,.model-opt-more')).filter(el=>{
+    let node=el.parentElement;
+    while(node&&node!==dd){
+      if(node.classList.contains('model-group-body')&&node.style.display==='none') return false;
+      node=node.parentElement;
+    }
+    return true;
+  });
   const _activeRowIndex=(rows)=>rows.findIndex(r=>r.classList.contains('is-highlighted'));
   const _highlightRow=(rows,idx)=>{
     for(const r of rows) r.classList.remove('is-highlighted');
@@ -2969,10 +3092,16 @@ function _applyToolsetsChip(toolsets) {
   // callers regardless of UI visibility. (#1431)
   wrap.style.display = '';
   const hasCustom = Array.isArray(toolsets) && toolsets.length > 0;
+  const isStaged = hasCustom
+    && typeof S !== 'undefined'
+    && S
+    && !S.session
+    && Array.isArray(S._pendingSessionToolsets);
   if (hasCustom) {
-    label.textContent = toolsets.join(', ');
+    const stagedSuffix = isStaged ? ' (staged)' : '';
+    label.textContent = toolsets.join(', ') + stagedSuffix;
     chip.classList.add('has-custom');
-    chip.title = t('session_toolsets') + ': ' + toolsets.join(', ');
+    chip.title = t('session_toolsets') + ': ' + toolsets.join(', ') + stagedSuffix;
   } else {
     label.textContent = t('session_toolsets_profile_defaults');
     chip.classList.remove('has-custom');
@@ -2982,7 +3111,10 @@ function _applyToolsetsChip(toolsets) {
 
 function _syncToolsetsChip() {
   if (typeof S === 'undefined' || !S || !S.session) {
-    _applyToolsetsChip(null);
+    const stagedToolsets = (typeof S !== 'undefined' && S && Array.isArray(S._pendingSessionToolsets))
+      ? S._pendingSessionToolsets
+      : null;
+    _applyToolsetsChip(stagedToolsets);
     return;
   }
   _applyToolsetsChip(S.session.enabled_toolsets || null);
@@ -3145,7 +3277,6 @@ function toggleToolsetsDropdown() {
   const dd = $('composerToolsetsDropdown');
   const chip = $('composerToolsetsChip');
   if (!dd || !chip) return;
-  if (typeof S === 'undefined' || !S || !S.session) return;
   // Don't open when the chip itself is hidden by responsive CSS (#1431).
   // offsetParent === null catches display:none on the element or any ancestor.
   if (chip.offsetParent === null) return;
@@ -3180,7 +3311,17 @@ function closeToolsetsDropdown() {
 }
 
 function _applySessionToolsets(toolsets) {
-  if (typeof S === 'undefined' || !S || !S.session) return;
+  if (typeof S === 'undefined' || !S) return;
+  if (!S.session) {
+    S._pendingSessionToolsets = toolsets;
+    _applyToolsetsChip(toolsets);
+    if (Array.isArray(toolsets) && toolsets.length) {
+      showToast('🔧 ' + t('session_toolsets_applied') + ': ' + toolsets.join(', '));
+    } else {
+      showToast('🌍 ' + t('session_toolsets_cleared'));
+    }
+    return;
+  }
   const sid = S.session.session_id;
   api('/api/session/toolsets', {
     method: 'POST',
@@ -3534,7 +3675,9 @@ if(typeof window!=='undefined'){
   if(!el) return;
   let _scrollRaf=0;
   el.addEventListener('scroll',()=>{
+    _scheduleMessageVirtualizedRender();
     if(_programmaticScroll) return; // ignore scrolls we triggered ourselves
+    _markMessageVirtualScrollActive();
     cancelAnimationFrame(_scrollRaf);
     _scrollRaf=requestAnimationFrame(()=>{
       const top=el.scrollTop;
@@ -3569,7 +3712,6 @@ if(typeof window!=='undefined'){
       const showBottomButton=!_scrollPinned && el.scrollHeight-top-el.clientHeight>80;
       _syncScrollToBottomCue(showBottomButton,{newMessage:_newMessageCueVisible});
       if(typeof _updateSessionStartJumpButton==='function') _updateSessionStartJumpButton();
-      _scheduleMessageVirtualizedRender();
       // Prefetch older messages before the reader hits the hard top. Prepending
       // then preserving scrollTop is seamless only if there is runway left for
       // the user's continued upward wheel/touch movement.
@@ -4568,7 +4710,7 @@ function renderMd(raw){
     t=t.replace(/\x00C(\d+)\x00/g,(_,i)=>_code_stash[+i]);
     // Stash [label](url) links before autolink so the URL in href= is not re-linked
     const _link_stash=[];
-    t=t.replace(/\[([^\]]+)\]\(((?:https?:\/\/|file:\/\/|workspace:\/\/|session:\/\/|mailto:|tel:)[^\s\)]+)\)/g,(_,lb,u)=>{_link_stash.push(_markdownAnchor(lb,u));return `\x00L${_link_stash.length-1}\x00`;});
+    t=t.replace(/\[([^\]]+)\]\(((?:https?:\/\/|file:\/\/|workspace:\/\/|session:\/\/|mailto:|tel:|message:)[^\s\)]+)\)/g,(_,lb,u)=>{_link_stash.push(_markdownAnchor(lb,u));return `\x00L${_link_stash.length-1}\x00`;});
     t=t.replace(/(https?:\/\/[^\s<>"')\]]+)/g,(url)=>{const trail=url.match(/[.,;:!?)]$/)?url.slice(-1):'';const clean=trail?url.slice(0,-1):url;return `<a href="${clean}" target="_blank" rel="noopener">${esc(clean)}</a>${trail}`;});
     t=t.replace(/\x00L(\d+)\x00/g,(_,i)=>_link_stash[+i]);
     t=t.replace(/\x00G(\d+)\x00/g,(_,i)=>_img_stash[+i]);
@@ -4709,7 +4851,7 @@ function renderMd(raw){
   // Stash existing <a> tags first to avoid re-linking already-linked URLs.
   const _a_stash=[];
   s=s.replace(/(<a\b[^>]*>[\s\S]*?<\/a>)/g,m=>{_a_stash.push(m);return `\x00A${_a_stash.length-1}\x00`;});
-  s=s.replace(/\[([^\]]+)\]\(((?:https?:\/\/|file:\/\/|workspace:\/\/|session:\/\/|mailto:|tel:)[^\s\)]+)\)/g,(_,label,url)=>_markdownAnchor(label,url));
+  s=s.replace(/\[([^\]]+)\]\(((?:https?:\/\/|file:\/\/|workspace:\/\/|session:\/\/|mailto:|tel:|message:)[^\s\)]+)\)/g,(_,label,url)=>_markdownAnchor(label,url));
   s=s.replace(/\x00A(\d+)\x00/g,(_,i)=>_a_stash[+i]);
   // Restore raw <pre> only after markdown rewrites so literal preformatted
   // content stays placeholder-protected, then let the sanitizer normalize tags.
@@ -4795,7 +4937,7 @@ function renderMd(raw){
     if(!compact) return false;
     if(/^(javascript|data|vbscript):/i.test(compact)) return false;
     if(/^https?:\/\//i.test(raw)) return true;
-    if(/^(mailto:|tel:)/i.test(raw)) return true;
+    if(/^(mailto:|tel:|message:)/i.test(raw)) return true;
     if(img && /^api\//i.test(raw)) return true;
     if(!img && (/^api\//i.test(raw) || /^#/.test(raw) || _isInternalSessionHref(raw))) return true;
     return false;
@@ -7088,7 +7230,7 @@ async function forceUpdate(btn){
   if(!target) return;
   const confirmed=await showConfirmDialog({
     title:'Force update '+target+'?',
-    message:'This will discard all local changes in the '+target+' repo and reset to the latest remote version. This cannot be undone.',
+    message:'This will discard all local changes and delete untracked files in the '+target+' repo, then reset to the latest remote version. This cannot be undone.',
     confirmLabel:'Force update',
     danger:true,
     focusCancel:true,
@@ -7260,6 +7402,7 @@ function getPendingSessionMessage(session, messagesOverride=null){
     attachments:attachments.length?attachments:undefined,
     _ts:session?.pending_started_at||Date.now()/1000,
     _pending:true,
+    _source:session?.pending_user_source||undefined,
   };
 }
 async function checkInflightOnBoot(sid) {
@@ -12480,25 +12623,43 @@ function loadPdfInline(container){
         })
         .then(pdf=>{
           if(!pdf) return;
-          pdf.getPage(1).then(page=>{
-            const canvas=document.createElement('canvas');
-            const scale=1.5;
-            const viewport=page.getViewport({scale});
-            canvas.width=viewport.width;
-            canvas.height=viewport.height;
-            canvas.className='pdf-preview-canvas';
-            page.render({canvasContext:canvas.getContext('2d'),viewport}).promise.then(()=>{
-              // Canvas bitmap is runtime state, not part of HTML serialization.
-              // Attach the canvas as a DOM node — interpolating its serialized
-              // form into a template string parses back as an empty canvas.
-              const dlUrl='api/media?path='+encodeURIComponent(path)+'&download=1';
-              const wrap=document.createElement('div');
-              wrap.className='pdf-preview-wrap';
-              wrap.innerHTML=`<div class="pdf-preview-header"><span>📄 ${esc(fname)}</span><a href="${dlUrl}" download="${esc(fname)}" class="pdf-download-link">${t('pdf_download')} ↓</a></div><div class="pdf-preview-body"></div>`;
-              wrap.querySelector('.pdf-preview-body').appendChild(canvas);
-              el.replaceWith(wrap);
-            });
-          });
+          const dlUrl='api/media?path='+encodeURIComponent(path)+'&download=1';
+          const total=pdf.numPages;
+          const pagesLabel=total>1?` · ${total} pages`:'';
+          const wrap=document.createElement('div');
+          wrap.className='pdf-preview-wrap';
+          wrap.innerHTML=`<div class="pdf-preview-header"><span>📄 ${esc(fname)}${pagesLabel}</span><a href="${dlUrl}" download="${esc(fname)}" class="pdf-download-link">${t('pdf_download')} ↓</a></div><div class="pdf-preview-body"></div>`;
+          const body=wrap.querySelector('.pdf-preview-body');
+          el.replaceWith(wrap);
+          // Render every page (capped) sequentially to limit memory; the
+          // canvases stack vertically in the scrollable preview body.
+          const MAX_PAGES=20;
+          const n=Math.min(total,MAX_PAGES);
+          if(total>MAX_PAGES){
+            const notice=document.createElement('div');
+            notice.className='pdf-preview-truncated';
+            notice.textContent=t('pdf_truncated',MAX_PAGES,total);
+            body.appendChild(notice);
+          }
+          // On a per-page failure, skip that page and continue so one malformed
+          // page can't silently halt the preview or surface an unhandled
+          // promise rejection (renderPage runs outside the outer .catch chain).
+          const renderPage=(i)=>{
+            if(i>n) return;
+            pdf.getPage(i).then(page=>{
+              const canvas=document.createElement('canvas');
+              const scale=1.5;
+              const viewport=page.getViewport({scale});
+              canvas.width=viewport.width;
+              canvas.height=viewport.height;
+              canvas.className='pdf-preview-canvas';
+              // Attach only after a successful render, so a render rejection
+              // (corrupt page data, null 2d context) can't leave a blank canvas
+              // behind — the .catch then simply skips to the next page.
+              return page.render({canvasContext:canvas.getContext('2d'),viewport}).promise.then(()=>{ body.appendChild(canvas); });
+            }).then(()=>renderPage(i+1)).catch(()=>renderPage(i+1));
+          };
+          renderPage(1);
         })
         .catch(()=>{
           const dlUrl='api/media?path='+encodeURIComponent(path)+'&download=1';
@@ -13707,7 +13868,7 @@ async function promptNewFile(targetDir = S.currentDir || '.'){
     if(!ws) return;
     try{
       const r=await api('/api/session/new',{method:'POST',body:JSON.stringify({workspace:ws})});
-      if(r&&r.session){S.session=r.session;S.messages=[];syncTopbar();renderMessages();await renderSessionList();}
+      if(r&&r.session){S._pendingSessionToolsets=null;S.session=r.session;S.messages=[];syncTopbar();renderMessages();await renderSessionList();}
     }catch(e){setStatus(t('create_failed')+e.message);return;}
   }
   if(!S.session)return;
@@ -13734,7 +13895,7 @@ async function promptNewFolder(targetDir = S.currentDir || '.'){
     if(!ws) return;
     try{
       const r=await api('/api/session/new',{method:'POST',body:JSON.stringify({workspace:ws})});
-      if(r&&r.session){S.session=r.session;S.messages=[];syncTopbar();renderMessages();await renderSessionList();}
+      if(r&&r.session){S._pendingSessionToolsets=null;S.session=r.session;S.messages=[];syncTopbar();renderMessages();await renderSessionList();}
     }catch(e){setStatus(t('folder_create_failed')+e.message);return;}
   }
   if(!S.session)return;

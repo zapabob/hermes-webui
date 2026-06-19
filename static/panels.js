@@ -538,11 +538,19 @@ async function loadCrons(animate) {
       return;
     }
     box.innerHTML = '';
+    // Partition active vs paused so paused jobs don't drown the list (#4026).
+    // _cronList stays the single source of truth — only the render is split,
+    // which keeps openCronDetail, _cronNewJobIds, and detail refresh untouched.
+    const _activeJobs = [];
+    const _pausedJobs = [];
     for (const job of _cronList) {
+      const status = _cronStatusMeta(job);
+      (status.state === 'paused' ? _pausedJobs : _activeJobs).push({ job, status });
+    }
+    const _appendCronItem = (parent, { job, status }) => {
       const item = document.createElement('div');
       item.className = 'cron-item';
       item.id = 'cron-' + job.id;
-      const status = _cronStatusMeta(job);
       const isNewRun = _cronNewJobIds.has(String(job.id));
       const isAgentMode = !job.no_agent;
       const profileLabel = _cronProfileLabel(job.profile);
@@ -557,7 +565,29 @@ async function loadCrons(animate) {
         </div>`;
       item.onclick = () => openCronDetail(job.id, item);
       if (_currentCronDetail && _currentCronDetail.id === job.id) item.classList.add('active');
-      box.appendChild(item);
+      parent.appendChild(item);
+    };
+    for (const entry of _activeJobs) _appendCronItem(box, entry);
+    if (_pausedJobs.length) {
+      let collapsed = true;
+      try { collapsed = localStorage.getItem('cron-paused-collapsed') !== '0'; } catch (_e) {}
+      const details = document.createElement('details');
+      details.className = 'cron-paused-section';
+      if (!collapsed) details.open = true;
+      const pausedLabel = t('cron_status_paused') || 'paused';
+      const headerLabel = pausedLabel.charAt(0).toUpperCase() + pausedLabel.slice(1);
+      const summary = document.createElement('summary');
+      summary.className = 'cron-paused-summary';
+      summary.textContent = `${headerLabel} (${_pausedJobs.length})`;
+      details.appendChild(summary);
+      details.addEventListener('toggle', () => {
+        try { localStorage.setItem('cron-paused-collapsed', details.open ? '0' : '1'); } catch (_e) {}
+      });
+      const inner = document.createElement('div');
+      inner.className = 'cron-paused-inner';
+      details.appendChild(inner);
+      for (const entry of _pausedJobs) _appendCronItem(inner, entry);
+      box.appendChild(details);
     }
     // Re-render current detail with fresh data if we have one and we're not in a form
     if (_currentCronDetail && _cronMode !== 'create' && _cronMode !== 'edit') {
@@ -2014,13 +2044,13 @@ function _kanbanStartPolling(){
 
 function _kanbanStopPolling(){
   if (_kanbanPollTimer) { clearInterval(_kanbanPollTimer); _kanbanPollTimer = null; }
-  if (_kanbanEventSource) { try { _kanbanEventSource.close(); } catch(_) {} _kanbanEventSource = null; }
+  if (_kanbanEventSource) { try { if(_kanbanEventSource.readyState!==2)_kanbanEventSource.close(); } catch(_) {} _kanbanEventSource = null; }
 }
 
 function _kanbanStartEventStream(){
   // Tear down any prior stream before opening a new one (board switch,
   // login change, etc.).
-  if (_kanbanEventSource) { try { _kanbanEventSource.close(); } catch(_) {} _kanbanEventSource = null; }
+  if (_kanbanEventSource) { try { if(_kanbanEventSource.readyState!==2)_kanbanEventSource.close(); } catch(_) {} _kanbanEventSource = null; }
   const since = Number(_kanbanLatestEventId || 0);
   let url = '/api/kanban/events/stream' + _kanbanBoardQuery({since: since});
   let es;
@@ -2314,14 +2344,51 @@ function _kanbanRunHtml(run){
   </div>`;
 }
 
+function _kanbanJsArg(s){
+  // Encode a value for safe interpolation inside an inline on* handler's JS
+  // string literal. JSON.stringify quotes/escapes for JS context; esc() then
+  // makes it safe inside the HTML attribute. Without this, a task id containing
+  // a quote breaks out of the handler (esc() alone is HTML-escaping, which the
+  // browser decodes BEFORE executing the inline handler). (#3797)
+  return esc(JSON.stringify(String(s == null ? '' : s)));
+}
+function _kanbanLinkableTaskOptions(excludeId){
+  // Datalist of existing task ids (with title as the option label) so the
+  // dependency field is a pick-from-real-tasks autocomplete rather than a blind
+  // free-text opaque-id box. Mirrors the tenant datalist pattern.
+  const cols = (_kanbanBoard && _kanbanBoard.columns) || [];
+  const seen = new Set();
+  const opts = [];
+  for (const col of cols) {
+    for (const task of (col.tasks || [])) {
+      const id = task && task.id;
+      if (!id || id === excludeId || seen.has(id)) continue;
+      seen.add(id);
+      opts.push(`<option value="${esc(id)}">${esc(_kanbanTaskTitle(task))}</option>`);
+    }
+  }
+  return opts.join('');
+}
 function _kanbanLinksHtml(links){
   const parents = (links && links.parents) || [];
   const children = (links && links.children) || [];
-  if (!parents.length && !children.length) return '';
-  const item = id => `<code>${esc(id)}</code>`;
-  return `<div class="kanban-detail-links-grid">
-    <div><strong>${esc(t('kanban_parents'))}</strong><div>${parents.length ? parents.map(item).join(' ') : esc(t('kanban_empty'))}</div></div>
-    <div><strong>${esc(t('kanban_children'))}</strong><div>${children.length ? children.map(item).join(' ') : esc(t('kanban_empty'))}</div></div>
+  const taskId = _kanbanCurrentTaskId;
+  const item = (id, isParent) => {
+    const parentId = isParent ? id : taskId;
+    const childId = isParent ? taskId : id;
+    return `<code>${esc(id)} <button class="btn mini" onclick="removeKanbanDependency(${_kanbanJsArg(parentId)},${_kanbanJsArg(childId)})" data-i18n="kanban_remove_dependency" title="${esc(t('kanban_remove_dependency') || 'Remove')}">✕</button></code>`;
+  };
+  const hasLinks = parents.length || children.length;
+  return `<div class="kanban-detail-links-section">
+    ${hasLinks ? `<div class="kanban-detail-links-grid">
+      <div><strong>${esc(t('kanban_parents'))}</strong><div>${parents.length ? parents.map(id => item(id, true)).join(' ') : esc(t('kanban_empty'))}</div></div>
+      <div><strong>${esc(t('kanban_children'))}</strong><div>${children.length ? children.map(id => item(id, false)).join(' ') : esc(t('kanban_empty'))}</div></div>
+    </div>` : ''}
+    <div class="kanban-detail-links-controls">
+      <input type="text" id="kanbanDependencyInput" class="kanban-detail-links-input" list="kanbanDependencyOptions" maxlength="255" autocomplete="off" data-i18n-placeholder="kanban_dependency_placeholder" placeholder="Task ID to link">
+      <datalist id="kanbanDependencyOptions">${_kanbanLinkableTaskOptions(taskId)}</datalist>
+      <button class="btn secondary" onclick="addKanbanDependency(${_kanbanJsArg(taskId)})" data-i18n="kanban_add_dependency">Add dependency</button>
+    </div>
   </div>`;
 }
 
@@ -2598,12 +2665,20 @@ function _kanbanResetTaskModalFields(values){
 function _kanbanSetTaskModalLabels(mode){
   const titleH = document.getElementById('kanbanTaskModalTitle');
   const submitBtn = document.getElementById('kanbanTaskModalSubmit');
+  const workspaceKindEl = document.getElementById('kanbanTaskModalWorkspaceKind');
+  const workspacePathEl = document.getElementById('kanbanTaskModalWorkspacePath');
   if (mode === 'edit') {
     if (titleH) titleH.textContent = t('kanban_edit_task') || 'Edit task';
     if (submitBtn) submitBtn.textContent = t('save') || 'Save';
+    // Disable workspace fields during edit since they are not handled by the backend
+    if (workspaceKindEl) workspaceKindEl.disabled = true;
+    if (workspacePathEl) workspacePathEl.disabled = true;
   } else {
     if (titleH) titleH.textContent = t('kanban_new_task') || 'New task';
     if (submitBtn) submitBtn.textContent = t('create') || 'Create';
+    // Enable workspace fields during create
+    if (workspaceKindEl) workspaceKindEl.disabled = false;
+    if (workspacePathEl) workspacePathEl.disabled = false;
   }
 }
 
@@ -2697,6 +2772,14 @@ function _kanbanTaskModalKey(ev){
   }
 }
 
+function _kanbanOnWorkspaceKindChange(){
+  const kindEl = document.getElementById('kanbanTaskModalWorkspaceKind');
+  const pathRowEl = document.getElementById('kanbanTaskModalWorkspacePathRow');
+  if (!kindEl || !pathRowEl) return;
+  const kind = kindEl.value;
+  pathRowEl.style.display = (kind === 'scratch') ? 'none' : 'block';
+}
+
 async function submitKanbanTaskModal(){
   const titleEl = document.getElementById('kanbanTaskModalTitleInput');
   const bodyEl = document.getElementById('kanbanTaskModalBody');
@@ -2704,6 +2787,8 @@ async function submitKanbanTaskModal(){
   const assigneeEl = document.getElementById('kanbanTaskModalAssignee');
   const tenantEl = document.getElementById('kanbanTaskModalTenant');
   const priorityEl = document.getElementById('kanbanTaskModalPriority');
+  const workspaceKindEl = document.getElementById('kanbanTaskModalWorkspaceKind');
+  const workspacePathEl = document.getElementById('kanbanTaskModalWorkspacePath');
   const errEl = document.getElementById('kanbanTaskModalError');
   const submitBtn = document.getElementById('kanbanTaskModalSubmit');
   const title = titleEl ? titleEl.value.trim() : '';
@@ -2715,12 +2800,23 @@ async function submitKanbanTaskModal(){
   // Build payload — for create we omit defaulted fields so the backend chooses;
   // for edit we send every field so users can clear assignee/tenant/body.
   const isEdit = _kanbanTaskModalMode === 'edit';
+  // Validate workspace path for non-scratch workspace kinds (create mode only)
+  const workspaceKind = workspaceKindEl ? workspaceKindEl.value : 'scratch';
+  if (!isEdit && workspaceKind !== 'scratch') {
+    const workspacePath = workspacePathEl ? workspacePathEl.value.trim() : '';
+    if (!workspacePath) {
+      if (errEl) errEl.textContent = t('kanban_workspace_path_required') || 'Workspace path is required for non-scratch workspaces.';
+      if (workspacePathEl) workspacePathEl.focus();
+      return;
+    }
+  }
   const payload = {title};
   const bodyVal = bodyEl ? bodyEl.value : '';
   const assigneeVal = assigneeEl ? assigneeEl.value.trim() : '';
   const tenantVal = tenantEl ? tenantEl.value.trim() : '';
   const statusVal = statusEl ? statusEl.value : '';
   const priorityRaw = priorityEl ? priorityEl.value : '';
+  const workspacePathVal = workspacePathEl ? workspacePathEl.value.trim() : '';
   if (isEdit) {
     payload.body = bodyVal;
     payload.assignee = assigneeVal || null;
@@ -2734,6 +2830,8 @@ async function submitKanbanTaskModal(){
     }
     const n = parseInt(priorityRaw, 10);
     payload.priority = Number.isNaN(n) ? 0 : n;
+    // Note: workspace_kind and workspace_path are not sent on edit because
+    // the backend _patch_task does not handle them (they are dropped).
   } else {
     if (bodyVal.trim()) payload.body = bodyVal;
     if (statusVal) payload.status = statusVal;
@@ -2743,6 +2841,8 @@ async function submitKanbanTaskModal(){
       const n = parseInt(priorityRaw, 10);
       if (!Number.isNaN(n)) payload.priority = n;
     }
+    payload.workspace_kind = workspaceKind;
+    if (workspacePathVal) payload.workspace_path = workspacePathVal;
   }
   // Soft warning: a Ready task with the explicit "Unassigned" option will sit
   // forever because the dispatcher skips unassigned rows (kanban_db.py:3567).
@@ -2812,6 +2912,40 @@ async function addKanbanComment(taskId){
     });
     if (input) input.value = '';
     await loadKanbanTask(taskId);
+  } catch(e) { showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error'); }
+}
+
+async function addKanbanDependency(taskId){
+  const input = document.getElementById('kanbanDependencyInput');
+  const linkTo = input ? input.value.trim() : '';
+  if (!taskId || !linkTo) return;
+  if (linkTo === taskId) {
+    showToast(t('kanban_dependency_self') || 'A task cannot depend on itself', 'error');
+    return;
+  }
+  try {
+    // "Add dependency" on task X means "X depends on linkTo" → linkTo is the
+    // prerequisite (parent) that must complete before X (child). The backend
+    // models a (parent_id, child_id) row as parent=prerequisite/child=dependent
+    // (api/kanban_bridge.py), so linkTo is the parent and the current task is
+    // the child. (#3797)
+    await api('/api/kanban/links' + _kanbanBoardQuery(), {
+      method: 'POST',
+      body: JSON.stringify({parent_id: linkTo, child_id: taskId}),
+    });
+    if (input) input.value = '';
+    await loadKanbanTask(taskId);
+  } catch(e) { showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error'); }
+}
+
+async function removeKanbanDependency(parentId, childId){
+  if (!parentId || !childId) return;
+  try {
+    await api('/api/kanban/links/delete' + _kanbanBoardQuery(), {
+      method: 'POST',
+      body: JSON.stringify({parent_id: parentId, child_id: childId}),
+    });
+    await loadKanbanTask(_kanbanCurrentTaskId);
   } catch(e) { showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error'); }
 }
 
@@ -3597,9 +3731,96 @@ function _renderLlmWikiStatus(d) {
       </div>
       <div class="wiki-status-footer">
         <span>${esc(toggleNote)}</span>
-        <a href="${esc(docsUrl)}" target="_blank" rel="noopener noreferrer">Docs</a>
+        <div style="display:flex;align-items:center;gap:8px;">
+          ${isReady || isEmpty ? `<button class="wiki-browse-btn" onclick="_openWikiBrowser()">${esc(t('wiki_browse'))}</button>` : ''}
+          <a href="${esc(docsUrl)}" target="_blank" rel="noopener noreferrer">Docs</a>
+        </div>
       </div>
     </div>`;
+}
+
+async function _openWikiBrowser() {
+  const existing = document.getElementById('wikiBrowserOverlay');
+  if (existing) { existing.style.display = 'flex'; return; }
+
+  const overlay = document.createElement('div');
+  overlay.id = 'wikiBrowserOverlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:9999;';
+
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.style.display = 'none'; });
+  document.addEventListener('keydown', function escHandler(e) {
+    if (e.key === 'Escape') { overlay.style.display = 'none'; document.removeEventListener('keydown', escHandler); }
+  });
+
+  const panel = document.createElement('div');
+  panel.style.cssText = 'background:var(--bg);border:1px solid var(--border);border-radius:8px;width:min(720px,95vw);max-height:80vh;display:flex;flex-direction:column;overflow:hidden;';
+
+  panel.innerHTML = `
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--border);">
+      <strong style="font-size:14px;">${esc(t('wiki_browse'))}</strong>
+      <button onclick="document.getElementById('wikiBrowserOverlay').style.display='none'" style="background:none;border:none;cursor:pointer;font-size:18px;color:var(--muted);">&#x2715;</button>
+    </div>
+    <div style="padding:10px 16px;border-bottom:1px solid var(--border);">
+      <input id="wikiBrowserSearch" type="text" placeholder="${esc(t('wiki_search_placeholder'))}" style="width:100%;padding:6px 10px;background:var(--input-bg,var(--bg));border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:13px;box-sizing:border-box;" />
+    </div>
+    <div id="wikiBrowserList" style="flex:1;overflow-y:auto;padding:8px 0;min-height:80px;"></div>
+    <div id="wikiBrowserContent" style="display:none;flex:1;overflow-y:auto;padding:16px;border-top:1px solid var(--border);"></div>`;
+
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+
+  const listEl = document.getElementById('wikiBrowserList');
+  const contentEl = document.getElementById('wikiBrowserContent');
+  const searchEl = document.getElementById('wikiBrowserSearch');
+  let _pages = [];
+
+  function _renderWikiPageList(filter) {
+    const q = (filter || '').toLowerCase();
+    const visible = q ? _pages.filter(p => p.name.toLowerCase().includes(q)) : _pages;
+    if (!visible.length) {
+      listEl.innerHTML = `<div style="padding:12px 16px;color:var(--muted);font-size:13px;">${esc(t('wiki_no_pages'))}</div>`;
+      return;
+    }
+    listEl.innerHTML = visible.map(p =>
+      `<div class="wiki-browser-item" data-path="${esc(p.path)}" style="padding:7px 16px;cursor:pointer;font-size:13px;border-radius:4px;margin:0 6px;" onmouseover="this.style.background='var(--hover,rgba(255,255,255,0.07))'" onmouseout="this.style.background=''" onclick="window._wikiBrowserOpenPage(this.dataset.path)">${esc(p.name)}</div>`
+    ).join('');
+  }
+
+  window._wikiBrowserOpenPage = async function(path) {
+    contentEl.innerHTML = '<div style="padding:12px;color:var(--muted);font-size:13px;">Loading...</div>';
+    contentEl.style.display = 'block';
+    listEl.style.display = 'none';
+    try {
+      const data = await api('/api/wiki/page?path=' + encodeURIComponent(path));
+      if (typeof renderMarkdownPreviewContent === 'function') {
+        contentEl.innerHTML = '<button onclick="window._wikiBrowserBack()" style="margin-bottom:10px;background:none;border:1px solid var(--border);border-radius:4px;padding:3px 10px;cursor:pointer;font-size:12px;color:var(--text);">&#8592; Back</button><div id="wikiBrowserMd"></div>';
+        renderMarkdownPreviewContent({content: data.content, el: document.getElementById('wikiBrowserMd')});
+      } else {
+        contentEl.innerHTML = '<button onclick="window._wikiBrowserBack()" style="margin-bottom:10px;background:none;border:1px solid var(--border);border-radius:4px;padding:3px 10px;cursor:pointer;font-size:12px;color:var(--text);">&#8592; Back</button><pre style="white-space:pre-wrap;word-break:break-word;font-size:12px;margin:0;">' + esc(data.content) + '</pre>';
+      }
+    } catch(e) {
+      contentEl.innerHTML = '<button onclick="window._wikiBrowserBack()" style="margin-bottom:10px;background:none;border:1px solid var(--border);border-radius:4px;padding:3px 10px;cursor:pointer;font-size:12px;color:var(--text);">&#8592; Back</button><div style="color:var(--error,#f55);">' + esc(e.message || String(e)) + '</div>';
+    }
+  };
+
+  window._wikiBrowserBack = function() {
+    contentEl.style.display = 'none';
+    listEl.style.display = '';
+  };
+
+  searchEl.addEventListener('input', () => _renderWikiPageList(searchEl.value));
+
+  try {
+    const data = await api('/api/wiki/browse');
+    _pages = Array.isArray(data && data.pages) ? data.pages : [];
+    if (!_pages.length) {
+      listEl.innerHTML = `<div style="padding:12px 16px;color:var(--muted);font-size:13px;">${esc(t('wiki_no_pages'))}</div>`;
+    } else {
+      _renderWikiPageList('');
+    }
+  } catch(e) {
+    listEl.innerHTML = `<div style="padding:12px 16px;color:var(--error,#f55);font-size:13px;">${esc(e.message || String(e))}</div>`;
+  }
 }
 
 /**
@@ -5227,7 +5448,7 @@ async function promptWorkspacePath(){
     if(!ws)return;
     try{
       const r=await api('/api/session/new',{method:'POST',body:JSON.stringify({workspace:ws})});
-      if(r&&r.session){S.session=r.session;S.messages=[];if(typeof syncTopbar==='function')syncTopbar();if(typeof renderMessages==='function')renderMessages();if(typeof renderSessionList==='function')await renderSessionList();}
+      if(r&&r.session){S._pendingSessionToolsets=null;S.session=r.session;S.messages=[];if(typeof syncTopbar==='function')syncTopbar();if(typeof renderMessages==='function')renderMessages();if(typeof renderSessionList==='function')await renderSessionList();}
     }catch(e){showToast(t('workspace_switch_failed')+e.message);return;}
     if(!S.session)return;
   }
@@ -5263,7 +5484,7 @@ async function switchToWorkspace(path,name){
     if(!ws){showToast(t('no_workspace'));return;}
     try{
       const r=await api('/api/session/new',{method:'POST',body:JSON.stringify({workspace:ws})});
-      if(r&&r.session){S.session=r.session;S.messages=[];if(typeof syncTopbar==='function')syncTopbar();if(typeof renderMessages==='function')renderMessages();if(typeof renderSessionList==='function')await renderSessionList();}
+      if(r&&r.session){S._pendingSessionToolsets=null;S.session=r.session;S.messages=[];if(typeof syncTopbar==='function')syncTopbar();if(typeof renderMessages==='function')renderMessages();if(typeof renderSessionList==='function')await renderSessionList();}
     }catch(e){if(typeof setStatus==='function')setStatus(t('switch_failed')+e.message);return;}
     if(!S.session)return;
   }
@@ -5291,6 +5512,7 @@ async function switchToWorkspace(path,name){
     // Explicit workspace switch = user overriding any pending profile-switch default.
     // Clear the one-shot flag so a subsequent newSession() inherits this choice instead.
     S._profileSwitchWorkspace=null;
+    S._pendingSessionToolsets=null;
     syncTopbar();
     await loadDir('.');
     if (_currentPanel === 'memory') await loadMemory(true);
@@ -5590,6 +5812,7 @@ window.addEventListener('resize',()=>{
 });
 
 async function switchToProfile(name) {
+  S._pendingSessionToolsets=null;
   // Profile switches are per-client cookie/TLS scoped, so a running stream in
   // the current session can safely continue while this tab moves to another
   // profile. The in-flight session stays attached to its original profile.
@@ -9100,37 +9323,64 @@ function loadMcpTools(){
     filterMcpTools();
   }).catch(()=>{list.innerHTML=`<div class="mcp-tool-error-state" style="color:#ef4444;font-size:12px;padding:6px 0">${esc(t('mcp_tools_load_failed'))}</div>`});
 }
+let _gatewayActionInFlight=false;
+function _gatewayActionButton(action){
+  const labels={start:t('gateway_start'),stop:t('gateway_stop'),restart:t('gateway_restart')};
+  return `<button class="sm-btn gateway-action-btn" data-gateway-action="${esc(action)}" onclick="_gatewayAction('${esc(action)}')" ${_gatewayActionInFlight?'disabled':''} style="padding:5px 10px;font-size:12px">${esc(labels[action]||action)}</button>`;
+}
+function _gatewayActionControls(r){
+  const actions=(r&&r.running)?['stop','restart']:['start'];
+  return `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">${actions.map(_gatewayActionButton).join('')}</div>`;
+}
+function _renderGatewayStatus(r){
+  const card=$('gatewayStatusCard');
+  if(!card||!r) return;
+  if(!r.configured){
+    card.innerHTML=`<div style="color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px"><span style="width:8px;height:8px;border-radius:50%;background:#f59e0b;display:inline-block"></span>${esc(t('gateway_not_configured'))}</div>${_gatewayActionControls(r)}`;
+    return;
+  }
+  if(!r.running){
+    const reason = _gatewayStatusReason(r);
+    const statusLabel = reason === 'gateway_stale_running_state'
+      ? t('gateway_metadata_stale')
+      : reason === 'remote_gateway_unreachable'
+        ? t('gateway_endpoint_unreachable')
+        : t('gateway_not_running');
+    card.innerHTML=`<div style="color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px"><span style="width:8px;height:8px;border-radius:50%;background:#ef4444;display:inline-block"></span>${esc(statusLabel)}</div>${_gatewayActionControls(r)}`;
+    return;
+  }
+  const platformIcons={telegram:'💬',discord:'🎮',slack:'📝',web:'🌐',api:'🔌'};
+  let badges='';
+  if(r.platforms&&r.platforms.length){
+    badges=r.platforms.map(p=>{
+      const icon=platformIcons[p.name]||'📡';
+      return `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;background:var(--code-bg);border:1px solid var(--border2);border-radius:12px;font-size:12px;font-weight:500">${icon} ${esc(p.label)}</span>`;
+    }).join(' ');
+  }
+  const lastActive=r.last_active?`<span style="font-size:11px;color:var(--muted)">${esc(t('gateway_last_active'))}: ${esc(new Date(r.last_active).toLocaleString())}</span>`:'';
+  const sessionInfo=r.session_count?`<span style="font-size:11px;color:var(--muted)">${r.session_count} ${esc(r.session_count!==1?t('gateway_sessions'):t('gateway_session'))}</span>`:'';
+  card.innerHTML=`<div style="display:flex;align-items:center;gap:6px;margin-bottom:8px"><span style="width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block"></span><span style="font-size:13px;font-weight:500;color:#22c55e">${esc(t('gateway_running'))}</span></div>${badges?`<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">${badges}</div>`:''}<div style="display:flex;gap:12px">${sessionInfo}${lastActive}</div>${_gatewayActionControls(r)}`;
+}
 function loadGatewayStatus(){
   const card=$('gatewayStatusCard');
   if(!card) return;
-  api('/api/gateway/status').then(r=>{
-    if(!r) return;
-    if(!r.configured){
-      card.innerHTML=`<div style="color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px"><span style="width:8px;height:8px;border-radius:50%;background:#f59e0b;display:inline-block"></span>${esc(t('gateway_not_configured'))}</div>`;
-      return;
-    }
-    if(!r.running){
-      const reason = _gatewayStatusReason(r);
-      const statusLabel = reason === 'gateway_stale_running_state'
-        ? t('gateway_metadata_stale')
-        : reason === 'remote_gateway_unreachable'
-          ? t('gateway_endpoint_unreachable')
-          : t('gateway_not_running');
-      card.innerHTML=`<div style="color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px"><span style="width:8px;height:8px;border-radius:50%;background:#ef4444;display:inline-block"></span>${esc(statusLabel)}</div>`;
-      return;
-    }
-    const platformIcons={telegram:'💬',discord:'🎮',slack:'📝',web:'🌐',api:'🔌'};
-    let badges='';
-    if(r.platforms&&r.platforms.length){
-      badges=r.platforms.map(p=>{
-        const icon=platformIcons[p.name]||'📡';
-        return `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;background:var(--code-bg);border:1px solid var(--border2);border-radius:12px;font-size:12px;font-weight:500">${icon} ${esc(p.label)}</span>`;
-      }).join(' ');
-    }
-    const lastActive=r.last_active?`<span style="font-size:11px;color:var(--muted)">${esc(t('gateway_last_active'))}${esc(new Date(r.last_active).toLocaleString())}</span>`:'';
-    const sessionInfo=r.session_count?`<span style="font-size:11px;color:var(--muted)">${esc(t('gateway_session_count',r.session_count))}</span>`:'';
-    card.innerHTML=`<div style="display:flex;align-items:center;gap:6px;margin-bottom:8px"><span style="width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block"></span><span style="font-size:13px;font-weight:500;color:#22c55e">${esc(t('gateway_running_label'))}</span></div>${badges?`<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">${badges}</div>`:''}<div style="display:flex;gap:12px">${sessionInfo}${lastActive}</div>`;
-  }).catch(()=>{card.innerHTML=`<div style="color:#ef4444;font-size:12px">${esc(t('gateway_load_failed'))}</div>`});
+  return api('/api/gateway/status').then(r=>_renderGatewayStatus(r)).catch(()=>{card.innerHTML=`<div style="color:#ef4444;font-size:12px">${esc(t('gateway_status_load_failed'))}</div>`});
+}
+async function _gatewayAction(action){
+  if(_gatewayActionInFlight) return;
+  _gatewayActionInFlight=true;
+  const buttons=[...document.querySelectorAll('.gateway-action-btn')];
+  buttons.forEach(btn=>{btn.disabled=true;});
+  try{
+    const result=await api(`/api/gateway/${encodeURIComponent(action)}`,{method:'POST',body:JSON.stringify({}),timeoutMs:70000,timeoutToast:false});
+    if(typeof showToast==='function') showToast(result&&result.message?result.message:t(`gateway_${action}_success`),3000,'success');
+  }catch(e){
+    const msg=e&&e.message?e.message:String(e||'');
+    if(typeof showToast==='function') showToast(`${t(`gateway_${action}_failed`)}${msg?': '+msg:''}`,5000,'error');
+  }finally{
+    _gatewayActionInFlight=false;
+    await loadGatewayStatus();
+  }
 }
 // Load MCP servers when system settings tab opens
 const _origSwitchSettings=switchSettingsSection;

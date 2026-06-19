@@ -5,6 +5,7 @@ Extracted from server.py (Sprint 11) so server.py is a thin shell.
 
 import html as _html
 import copy
+import errno
 import io
 import gzip
 import json
@@ -949,6 +950,206 @@ def _load_gateway_session_identity_map() -> dict[str, dict]:
     return mapping.copy()
 
 
+def _gateway_status_payload() -> dict:
+    import datetime
+
+    identity_map = _load_gateway_session_identity_map()
+    sessions_path = _gateway_session_metadata_path()
+
+    # Detect whether the gateway process is alive, independent of connected
+    # messaging platforms. An empty identity_map means zero connected
+    # platforms, not necessarily a stopped gateway.
+    health = build_agent_health_payload()
+    alive = health.get("alive")
+    details = health.get("details") if isinstance(health.get("details"), dict) else {}
+    health_reason = details.get("reason")
+    health_state = details.get("state")
+    health_gateway_state = details.get("gateway_state")
+    if alive is True:
+        running = True
+        configured = True
+    elif alive is False:
+        running = False
+        configured = True
+    else:
+        gateway_running_metadata = (
+            health_reason == "gateway_stale_running_state"
+            or health_gateway_state == "running"
+        )
+        configured = True if gateway_running_metadata else bool(identity_map)
+        running = bool(identity_map)
+
+    platforms_set: set[str] = set()
+    for meta in identity_map.values():
+        raw = meta.get("raw_source") or meta.get("platform") or ""
+        norm = _normalize_messaging_source(raw)
+        if norm:
+            platforms_set.add(norm)
+    platform_labels = {
+        "telegram": "Telegram",
+        "discord": "Discord",
+        "slack": "Slack",
+        "email": "Email",
+        "web": "Web",
+        "api": "API",
+    }
+    platforms = sorted(
+        [{"name": p, "label": platform_labels.get(p, p.title())} for p in platforms_set],
+        key=lambda x: x["label"],
+    )
+    last_active = ""
+    if running and sessions_path.exists():
+        try:
+            mtime = sessions_path.stat().st_mtime
+            last_active = datetime.datetime.fromtimestamp(mtime).isoformat()
+        except Exception:
+            pass
+    return {
+        "running": running,
+        "configured": configured,
+        "platforms": platforms,
+        "last_active": last_active,
+        "session_count": len(identity_map),
+        "health": {
+            "state": health_state,
+            "reason": health_reason,
+            "gateway_state": health_gateway_state,
+        },
+    }
+
+
+_GATEWAY_LIFECYCLE_TIMEOUT_SECONDS = 60
+
+# Server-side single-flight guard for gateway lifecycle actions. The client
+# disables its button while a request is in flight, but a scripted authed
+# client could still fire overlapping start/stop/restart calls, spawning
+# concurrent `hermes gateway` subprocesses. Serialize them here (mirrors the
+# self-update _apply_lock pattern): a non-blocking acquire returns 409 on
+# contention rather than launching a second overlapping subprocess.
+_GATEWAY_ACTION_LOCK = threading.Lock()
+
+
+def _run_gateway_lifecycle_command(action: str) -> subprocess.CompletedProcess:
+    if action not in {"start", "stop", "restart"}:
+        raise ValueError("unsupported gateway action")
+
+    from api import config as api_config
+    from api.profiles import get_active_profile_name
+
+    agent_dir = getattr(api_config, "_AGENT_DIR", None)
+    if not agent_dir:
+        raise FileNotFoundError("Hermes agent checkout not found")
+    agent_dir = Path(agent_dir).expanduser().resolve()
+    main_py = agent_dir / "hermes_cli" / "main.py"
+    if not main_py.exists():
+        raise FileNotFoundError("Hermes agent CLI entrypoint not found")
+
+    cmd = [str(getattr(api_config, "PYTHON_EXE", sys.executable)), str(main_py)]
+    profile_name = ""
+    try:
+        profile_name = str(get_active_profile_name() or "").strip()
+    except Exception as exc:
+        logger.debug("Could not resolve active profile for gateway lifecycle: %s", exc)
+    if profile_name and profile_name != "default":
+        cmd.extend(["--profile", profile_name])
+    cmd.extend(["gateway", action])
+
+    env = os.environ.copy()
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("BROWSER", "echo")
+    return subprocess.run(
+        cmd,
+        cwd=str(agent_dir),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=_GATEWAY_LIFECYCLE_TIMEOUT_SECONDS,
+    )
+
+
+def _handle_gateway_lifecycle(handler, action: str, body: dict):
+    del body  # Reserved for future per-gateway naming without changing the route contract.
+    # Reject overlapping lifecycle actions instead of spawning concurrent
+    # `hermes gateway` subprocesses (a non-blocking acquire — the action holds
+    # the lock for at most _GATEWAY_LIFECYCLE_TIMEOUT_SECONDS).
+    if action not in {"start", "stop", "restart"}:
+        return bad(handler, "unsupported gateway action", 400)
+    if not _GATEWAY_ACTION_LOCK.acquire(blocking=False):
+        return j(
+            handler,
+            {
+                "ok": False,
+                "error": "Another gateway action is already in progress; try again shortly.",
+                "action": action,
+            },
+            status=409,
+        )
+    try:
+        result = _run_gateway_lifecycle_command(action)
+    except ValueError as exc:
+        return bad(handler, str(exc), 400)
+    except FileNotFoundError as exc:
+        return j(handler, {"ok": False, "error": _sanitize_error(exc), "action": action}, status=500)
+    except subprocess.TimeoutExpired as exc:
+        logger.warning(
+            "Gateway %s command timed out after %ss; stdout=%r stderr=%r",
+            action,
+            _GATEWAY_LIFECYCLE_TIMEOUT_SECONDS,
+            exc.stdout,
+            exc.stderr,
+        )
+        return j(
+            handler,
+            {
+                "ok": False,
+                "error": f"Gateway {action} timed out after {_GATEWAY_LIFECYCLE_TIMEOUT_SECONDS} seconds",
+                "action": action,
+            },
+            status=504,
+        )
+    except Exception as exc:
+        logger.exception("Gateway %s command failed before completion", action)
+        return j(handler, {"ok": False, "error": _sanitize_error(exc), "action": action}, status=500)
+    finally:
+        _GATEWAY_ACTION_LOCK.release()
+
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    if result.returncode != 0:
+        logger.warning(
+            "Gateway %s command failed with exit code %s; stdout=%r stderr=%r",
+            action,
+            result.returncode,
+            stdout,
+            stderr,
+        )
+        return j(
+            handler,
+            {
+                "ok": False,
+                "error": f"Gateway {action} failed with exit code {result.returncode}",
+                "action": action,
+                "returncode": result.returncode,
+            },
+            status=500,
+        )
+
+    return j(
+        handler,
+        {
+            "ok": True,
+            "action": action,
+            # Do NOT return captured stdout/stderr — the `hermes gateway` CLI
+            # prints service/PID/status details the browser shouldn't receive
+            # (mirrors the failure path, which already suppresses them). The
+            # frontend localizes its own success copy; the refreshed status
+            # payload carries the user-facing state.
+            "message": f"Gateway {action} completed.",
+            "status": _gateway_status_payload(),
+        },
+    )
+
+
 def _mark_cron_running(job_id: str):
     with _RUNNING_CRON_LOCK:
         _RUNNING_CRON_JOBS[job_id] = time.time()
@@ -1509,7 +1710,22 @@ def _session_list_cache_source_stamp(key: tuple) -> tuple[tuple[int, int], tuple
         _session_list_cache_path_stamp(gateway_metadata_path),
         _session_list_cache_path_stamp(session_index_path),
         _session_list_cache_path_stamp(settings_file),
+        # Commit-reliable content fingerprint of state.db — the file-stat stamps
+        # above can collide under WAL-mode writes (same mtime_ns bucket + WAL
+        # frame size), so without this a freshly-committed CLI/gateway session
+        # could be served stale for the cache TTL. Mirrors the models-layer fix.
+        _session_list_cache_state_db_fingerprint(state_db_path),
     )
+
+
+def _session_list_cache_state_db_fingerprint(state_db_path: Path | None):
+    if state_db_path is None:
+        return None
+    try:
+        from api.models import _sqlite_content_fingerprint
+        return _sqlite_content_fingerprint(state_db_path)
+    except Exception:
+        return None
 
 
 def _session_list_cache_overlay_runtime_rows(rows: list[dict]) -> list[dict]:
@@ -2024,6 +2240,8 @@ def _clear_stale_stream_state(session) -> bool:
                     original_stub.pending_attachments = []
                 if hasattr(original_stub, "pending_started_at"):
                     original_stub.pending_started_at = None
+                if hasattr(original_stub, "pending_user_source"):
+                    original_stub.pending_user_source = None
             except Exception:
                 pass
             return False
@@ -2063,6 +2281,8 @@ def _clear_stale_stream_state(session) -> bool:
                             original_stub.pending_attachments = []
                         if hasattr(original_stub, "pending_started_at"):
                             original_stub.pending_started_at = None
+                        if hasattr(original_stub, "pending_user_source"):
+                            original_stub.pending_user_source = None
                     except Exception:
                         pass
                 return True
@@ -2076,6 +2296,8 @@ def _clear_stale_stream_state(session) -> bool:
             session.pending_attachments = []
         if hasattr(session, "pending_started_at"):
             session.pending_started_at = None
+        if hasattr(session, "pending_user_source"):
+            session.pending_user_source = None
         try:
             # Runtime cleanup is not user activity; do not bubble old sessions
             # to the top of the sidebar just because a stale stream flag was
@@ -2097,6 +2319,8 @@ def _clear_stale_stream_state(session) -> bool:
                 original_stub.pending_attachments = []
             if hasattr(original_stub, "pending_started_at"):
                 original_stub.pending_started_at = None
+            if hasattr(original_stub, "pending_user_source"):
+                original_stub.pending_user_source = None
         except Exception:
             pass
     return True
@@ -2393,7 +2617,7 @@ def _get_or_materialize_session(sid: str):
 
     # Preserve source metadata fields
     def _apply_source_meta(s):
-        s.is_cli_session = True
+        s.is_cli_session = is_cli_session_row(cli_meta)
         s.source_tag = cli_meta.get("source_tag")
         s.raw_source = cli_meta.get("raw_source") or cli_meta.get("source_tag")
         s.session_source = cli_meta.get("session_source")
@@ -3213,11 +3437,60 @@ def _custom_provider_api_key_for_context(entry: dict, provider: str) -> str:
         return ""
 
 
+def _context_length_config_api_key_for_provider(
+    provider: str | None,
+    cfg: dict | None,
+) -> str:
+    """Return a config/env API key usable for context-window metadata lookup."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    provider = _canonical_context_provider(provider)
+
+    def _resolve_key(raw_api_key, raw_key_env=None) -> str:
+        api_key_text = str(raw_api_key or "").strip()
+        if (
+            api_key_text.startswith("${")
+            and api_key_text.endswith("}")
+            and len(api_key_text) > 3
+        ):
+            resolved = os.getenv(api_key_text[2:-1], "").strip()
+            if resolved:
+                return resolved
+        elif api_key_text:
+            return api_key_text
+        key_env = str(raw_key_env or "").strip()
+        if key_env:
+            resolved = os.getenv(key_env, "").strip()
+            if resolved:
+                return resolved
+        return ""
+
+    providers_cfg = cfg.get("providers", {})
+    if isinstance(providers_cfg, dict):
+        for provider_key, provider_cfg in providers_cfg.items():
+            if not isinstance(provider_cfg, dict):
+                continue
+            if not _providers_match_for_context(provider_key, provider):
+                continue
+            api_key = _resolve_key(provider_cfg.get("api_key"), provider_cfg.get("key_env"))
+            if api_key:
+                return api_key
+
+    model_cfg = cfg.get("model", {})
+    if isinstance(model_cfg, dict):
+        model_provider = _canonical_context_provider(model_cfg.get("provider"))
+        if not provider or _providers_match_for_context(model_provider, provider):
+            api_key = _resolve_key(model_cfg.get("api_key"), model_cfg.get("key_env"))
+            if api_key:
+                return api_key
+    return ""
+
+
 def _context_length_lookup_inputs_for_model(
     model: str | None,
     provider: str | None = None,
     *,
     base_url: str | None = None,
+    api_key: str | None = None,
     cfg: dict | None = None,
 ) -> _ContextLengthLookupInputs:
     """Return the effective metadata resolver inputs for a WebUI model.
@@ -3272,7 +3545,7 @@ def _context_length_lookup_inputs_for_model(
             break
 
     custom_context_length = None
-    effective_api_key = ""
+    effective_api_key = str(api_key or "").strip()
     if custom_providers:
         target_base = effective_base_url.rstrip("/")
         model_candidates = set(_model_lookup_candidates(bare_model or model_for_lookup))
@@ -3302,7 +3575,8 @@ def _context_length_lookup_inputs_for_model(
                 effective_provider = entry_slug
             if not effective_base_url and entry_base:
                 effective_base_url = entry_base
-            effective_api_key = _custom_provider_api_key_for_context(entry, effective_provider or entry_slug)
+            if not effective_api_key:
+                effective_api_key = _custom_provider_api_key_for_context(entry, effective_provider or entry_slug)
             custom_context_length = _models_config_context_length(models_cfg, bare_model or model_for_lookup)
             break
 
@@ -3319,6 +3593,9 @@ def _context_length_lookup_inputs_for_model(
             )
         ):
             global_context_length = _positive_context_length(raw_cfg_ctx)
+
+    if not effective_api_key:
+        effective_api_key = _context_length_config_api_key_for_provider(effective_provider, cfg)
 
     return _ContextLengthLookupInputs(
         config_context_length=provider_context_length or custom_context_length or global_context_length,
@@ -3816,6 +4093,9 @@ def _resolve_effective_session_model_provider_for_display(session) -> str | None
 def _resolve_context_length_for_session_model(
     model: str | None,
     provider: str | None = None,
+    *,
+    base_url: str | None = None,
+    api_key: str | None = None,
 ) -> int:
     """Best-effort current context window for a session model.
 
@@ -3834,6 +4114,8 @@ def _resolve_context_length_for_session_model(
         _ctx_lookup = _context_length_lookup_inputs_for_model(
             model_for_lookup,
             provider,
+            base_url=base_url,
+            api_key=api_key,
             cfg=_cfg_for_cl if isinstance(_cfg_for_cl, dict) else {},
         )
         try:
@@ -3850,6 +4132,119 @@ def _resolve_context_length_for_session_model(
             return _get_cl(model_for_lookup, _ctx_lookup.base_url) or 0
     except Exception:
         return 0
+
+
+def _session_context_length_lookup_state(
+    model: str | None,
+    provider: str | None,
+) -> tuple[str, str, str, str]:
+    """Return model/provider/base_url/api_key inputs for session context lookup.
+
+    This stays config-based and side-effect-free for GET /api/session. It avoids
+    a live provider catalog rebuild while still aligning the reload path with
+    the base URL / custom-provider key shape used by streaming saves. (#4248)
+    """
+    model_for_lookup = str(model or "").strip()
+    provider_for_lookup = str(provider or "").strip()
+    base_url_for_lookup = ""
+    api_key_for_lookup = ""
+    if not model_for_lookup:
+        return "", provider_for_lookup, "", ""
+    try:
+        from api.config import resolve_model_provider
+
+        model_for_resolution = model_with_provider_context(model_for_lookup, provider_for_lookup or None)
+        resolved_model, resolved_provider, resolved_base_url = resolve_model_provider(model_for_resolution)
+        model_for_lookup = str(resolved_model or model_for_lookup).strip()
+        provider_for_lookup = str(resolved_provider or provider_for_lookup or "").strip()
+        base_url_for_lookup = str(resolved_base_url or "").strip()
+    except Exception:
+        logger.debug("session context-length lookup state resolution failed", exc_info=True)
+    if provider_for_lookup.startswith("custom:"):
+        try:
+            from api.config import resolve_custom_provider_connection
+
+            custom_key, custom_base = resolve_custom_provider_connection(provider_for_lookup)
+            api_key_for_lookup = str(custom_key or "").strip()
+            if not base_url_for_lookup:
+                base_url_for_lookup = str(custom_base or "").strip()
+        except Exception:
+            logger.debug("custom provider context-length connection resolution failed", exc_info=True)
+    return model_for_lookup, provider_for_lookup, base_url_for_lookup, api_key_for_lookup
+
+
+def _session_model_identity_matches(
+    stored_model: str | None,
+    stored_provider: str | None,
+    resolved_model: str | None,
+    resolved_provider: str | None,
+) -> bool:
+    stored = str(stored_model or "").strip()
+    resolved = str(resolved_model or "").strip()
+    if not stored or not resolved:
+        return False
+
+    def _split_model_identity(value: str) -> tuple[str, str | None]:
+        # Handle BOTH provider-qualified shapes so a slash-prefixed session model
+        # (e.g. ``deepseek/deepseek-v4-1m``, OpenRouter-style) compares equal to its
+        # resolved bare id. ``_split_provider_qualified_model`` only handles the
+        # ``@provider:model`` form; without the slash case a reload of a
+        # slash-stored model is wrongly treated as a model change, bypassing the
+        # #4248 256k-clobber guard (Codex regression gate, v0.51.x).
+        bare, prov = _split_provider_qualified_model(value)
+        if prov is None and "/" in value:
+            prefix, rest = value.split("/", 1)
+            prefix = prefix.strip()
+            rest = rest.strip()
+            if prefix and rest:
+                return rest, prefix
+        return bare, prov
+
+    stored_bare, stored_explicit_provider = _split_model_identity(stored)
+    resolved_bare, resolved_explicit_provider = _split_model_identity(resolved)
+    stored_provider_norm = _canonical_context_provider(stored_explicit_provider or stored_provider)
+    resolved_provider_norm = _canonical_context_provider(resolved_explicit_provider or resolved_provider)
+    if stored == resolved and stored_provider_norm == resolved_provider_norm:
+        return True
+    if stored_bare != resolved_bare:
+        return False
+    if stored_provider_norm and resolved_provider_norm:
+        return stored_provider_norm == resolved_provider_norm
+    return True
+
+
+def _should_accept_session_context_length_refresh(
+    persisted: int,
+    resolved: int,
+    *,
+    model_changed: bool = False,
+) -> bool:
+    if not resolved:
+        return False
+    if not persisted:
+        return True
+    # #4248: an anonymous reload resolver can still fall through to the agent
+    # metadata default fallback. Do not let that lower-confidence 256k value
+    # clobber a larger context window persisted by the streaming path. If the
+    # effective model changed, though, a 256k result may be the real new model
+    # window and should replace the old snapshot.
+    return model_changed or not (resolved == 256_000 and persisted > resolved)
+
+
+def _rescale_threshold_tokens_for_context_window(
+    threshold: int,
+    old_window: int,
+    new_window: int,
+) -> int:
+    try:
+        threshold = int(threshold or 0)
+        old_window = int(old_window or 0)
+        new_window = int(new_window or 0)
+    except (TypeError, ValueError):
+        return 0
+    if threshold <= 0 or old_window <= 0 or new_window <= 0:
+        return 0
+    return max(1, int(threshold * new_window / old_window))
 
 
 def _session_model_state_from_request(
@@ -5402,6 +5797,9 @@ def _llm_wiki_config_path() -> str | None:
 # Cap WIKI walks to prevent self-DoS if WIKI_PATH points at /, /etc, /home, etc.
 # Real LLM wikis have under a few thousand files; 10k is generous and catches misconfig.
 _LLM_WIKI_MAX_FILES = 10000
+# Cap a single served wiki page at 2 MiB so a huge/binary file can't be slurped
+# wholesale into memory + a JSON response (DoS / memory-blowup guard).
+_LLM_WIKI_MAX_PAGE_BYTES = 2 * 1024 * 1024
 # Refuse to walk these system roots even if explicitly configured.
 _LLM_WIKI_FORBIDDEN_ROOTS = frozenset(
     str(Path(p).expanduser().resolve()) for p in ("/", "/etc", "/usr", "/var", "/opt", "/sys", "/proc")
@@ -5460,16 +5858,31 @@ def _llm_wiki_count_files(root: Path) -> int:
 
 def _llm_wiki_page_files(wiki_path: Path) -> list[Path]:
     pages: list[Path] = []
-    # Defense in depth: refuse forbidden system roots.
+    # Defense in depth: refuse forbidden system roots, and resolve the wiki root
+    # ONCE as the single trust base for all containment checks below.
     try:
-        if str(wiki_path.resolve()) in _LLM_WIKI_FORBIDDEN_ROOTS:
+        wiki_real = wiki_path.resolve()
+        if str(wiki_real) in _LLM_WIKI_FORBIDDEN_ROOTS:
             return pages
     except Exception:
         return pages
+
+    def _is_clean_relpath(rel: Path) -> bool:
+        # No dot-prefixed segment (dotfile/dotdir) anywhere in the path.
+        return not any(part.startswith(".") for part in rel.parts)
+
     iterated = 0
     for dirname in _LLM_WIKI_PAGE_DIRS:
         section = wiki_path / dirname
         if not section.exists() or not section.is_dir():
+            continue
+        # The section itself must resolve UNDER the real wiki root — guards a
+        # symlinked section (e.g. concepts -> /tmp/outside) from exposing files
+        # outside the wiki tree entirely.
+        try:
+            section_real = section.resolve()
+            section_real.relative_to(wiki_real)
+        except (OSError, ValueError):
             continue
         for item in section.rglob("*.md"):
             iterated += 1
@@ -5477,9 +5890,21 @@ def _llm_wiki_page_files(wiki_path: Path) -> list[Path]:
                 return pages  # bounded
             try:
                 rel = item.relative_to(section)
-                if item.is_file() and not any(part.startswith(".") for part in rel.parts):
-                    pages.append(item)
-            except Exception:
+                if not item.is_file() or not _is_clean_relpath(rel):
+                    continue
+                # Resolve the real target and require it to live under BOTH the
+                # real wiki root and the real section, with no dot-prefixed
+                # segment on the resolved-relative path. This closes symlink
+                # escapes whose link name looks like a clean *.md page but whose
+                # target is an arbitrary / hidden / out-of-tree file (the read
+                # endpoint would otherwise serve it).
+                item_real = item.resolve()
+                item_real.relative_to(section_real)
+                rel_real = item_real.relative_to(wiki_real)
+                if not _is_clean_relpath(rel_real):
+                    continue
+                pages.append(item)
+            except (OSError, ValueError):
                 continue
     return pages
 
@@ -6836,6 +7261,91 @@ def handle_get(handler, parsed) -> bool:
         return True
     if parsed.path == "/api/wiki/status":
         return _handle_llm_wiki_status(handler, parsed)
+    if parsed.path == "/api/wiki/browse":
+        wiki_root, _, _ = _llm_wiki_resolve_path()
+        if not wiki_root or not os.path.isdir(wiki_root):
+            return bad(handler, "Wiki not configured or directory not found", status=404)
+        page_paths = _llm_wiki_page_files(wiki_root)
+        pages = []
+        for fp in sorted(page_paths, key=lambda p: str(p).lower()):
+            try:
+                rel = fp.relative_to(wiki_root)
+            except ValueError:
+                continue
+            try:
+                st = fp.stat()
+            except OSError:
+                continue
+            pages.append({"name": fp.name, "path": str(rel).replace("\\", "/"), "size": st.st_size, "mtime": int(st.st_mtime)})
+        return j(handler, {"pages": pages})
+    if parsed.path == "/api/wiki/page":
+        wiki_root, _, _ = _llm_wiki_resolve_path()
+        page_path = parse_qs(parsed.query or "").get("path", [""])[0]
+        if not wiki_root or not page_path:
+            return bad(handler, "Wiki not configured or path not provided", status=400)
+        # Reject a real `..` path SEGMENT (or absolute path), not the bare
+        # substring — a legitimate listed filename like `v1..v2.md` contains
+        # ".." without being traversal. Containment + the resolved-allowlist
+        # membership check below are the actual security boundary.
+        _page_parts = page_path.replace("\\", "/").split("/")
+        if os.path.isabs(page_path) or any(part == ".." for part in _page_parts):
+            return bad(handler, "Invalid path", status=400)
+        full_path = Path(os.path.join(wiki_root, page_path))
+        if not _skill_path_within(Path(wiki_root), full_path):
+            return bad(handler, "Invalid path", status=400)
+        # Only serve files the browse/list path would surface (same allowlist:
+        # *.md under the wiki page-dirs, no dotfiles, forbidden-roots guard).
+        # Without this the read endpoint could return ANY file inside the wiki
+        # root (e.g. .env / .git/config / non-.md), since containment alone
+        # doesn't constrain which files are readable (Opus review finding).
+        # Capture each allowlisted page's STABLE IDENTITY (st_dev, st_ino) so the
+        # post-open fstat below can detect a file/parent-dir swapped in after the
+        # allowlist check (TOCTOU write-race, Codex finding) — a pathname re-open
+        # alone can't, since O_NOFOLLOW only guards the final component, not a
+        # swapped parent directory.
+        allowed_identity: dict[Path, tuple] = {}
+        try:
+            for _p in _llm_wiki_page_files(Path(wiki_root)):
+                try:
+                    rp = _p.resolve()
+                    st0 = rp.stat()
+                    allowed_identity[rp] = (st0.st_dev, st0.st_ino)
+                except OSError:
+                    continue
+        except Exception:
+            allowed_identity = {}
+        try:
+            resolved_target = full_path.resolve()
+        except OSError:
+            return bad(handler, "Page not found", status=404)
+        if resolved_target not in allowed_identity:
+            return bad(handler, "Page not found", status=404)
+        # Read the ALREADY-RESOLVED, allowlisted real path with O_NOFOLLOW so a
+        # symlink swapped in for the final component between the allowlist check
+        # and the read is refused rather than followed. Then fstat the open fd
+        # and require its (st_dev, st_ino) to match the identity captured during
+        # allowlisting — this closes a parent-directory swap that O_NOFOLLOW
+        # would otherwise follow. Any mismatch / vanished / swapped page returns
+        # a clean 404, never a 500.
+        try:
+            fd = os.open(str(resolved_target), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                st_open = os.fstat(fd)
+                if (st_open.st_dev, st_open.st_ino) != allowed_identity[resolved_target]:
+                    return bad(handler, "Page not found", status=404)
+                raw = os.read(fd, _LLM_WIKI_MAX_PAGE_BYTES + 1)
+            finally:
+                os.close(fd)
+            if len(raw) > _LLM_WIKI_MAX_PAGE_BYTES:
+                raw = raw[:_LLM_WIKI_MAX_PAGE_BYTES]
+            content = raw.decode("utf-8", errors="replace")
+        except (FileNotFoundError, IsADirectoryError):
+            return bad(handler, "Page not found", status=404)
+        except OSError:
+            # ELOOP (symlink swapped in under O_NOFOLLOW) or any other read
+            # failure → clean 404, never a 500.
+            return bad(handler, "Could not read page", status=404)
+        return j(handler, {"content": content, "path": page_path})
     if parsed.path == "/api/logs":
         return _handle_logs(handler, parsed)
 
@@ -6903,7 +7413,15 @@ def handle_get(handler, parsed) -> bool:
         query = parse_qs(parsed.query)
         provider_id = (query.get("provider", [""])[0] or None)
         refresh = (query.get("refresh", [""])[0] or "").strip().lower() in {"1", "true", "yes", "on"}
-        return j(handler, get_provider_quota(provider_id, refresh=refresh))
+        # Bind the active request's profile env (matches /api/providers and
+        # /api/models/live). #4365 added a credential_pool.load_pool() path in
+        # get_provider_quota for all pooled providers; without this wrapper that
+        # read/write runs under the process-default profile, so a multi-profile
+        # client would see (and seed) the default profile's pool instead of its
+        # own (#4247/#4067 profile-isolation class).
+        from api.profiles import profile_env_for_active_request
+        with profile_env_for_active_request("/api/provider/quota", logger_override=logger):
+            return j(handler, get_provider_quota(provider_id, refresh=refresh))
 
     if parsed.path == "/api/provider/cost-history":
         query = parse_qs(parsed.query)
@@ -7147,19 +7665,46 @@ def handle_get(handler, parsed) -> bool:
             _persisted_cl = getattr(s, "context_length", 0) or 0
             _threshold_tokens = getattr(s, "threshold_tokens", 0) or 0
             if (not _persisted_cl) or resolve_model:
+                _stored_model_for_lookup = getattr(s, "model", "") or ""
+                _stored_provider_for_lookup = getattr(s, "model_provider", None) or ""
                 _model_for_lookup = (
-                    effective_model or getattr(s, "model", "") or ""
+                    effective_model or _stored_model_for_lookup
                 ).strip()
-                _fb_cl = _resolve_context_length_for_session_model(
+                (
+                    _model_for_lookup,
+                    _provider_for_lookup,
+                    _base_url_for_lookup,
+                    _api_key_for_lookup,
+                ) = _session_context_length_lookup_state(
                     _model_for_lookup,
                     effective_provider or getattr(s, "model_provider", None) or "",
                 )
-                if _fb_cl:
+                _fb_cl = _resolve_context_length_for_session_model(
+                    _model_for_lookup,
+                    _provider_for_lookup,
+                    base_url=_base_url_for_lookup,
+                    api_key=_api_key_for_lookup,
+                )
+                _model_changed_for_context = not _session_model_identity_matches(
+                    _stored_model_for_lookup,
+                    _stored_provider_for_lookup,
+                    _model_for_lookup,
+                    _provider_for_lookup,
+                )
+                if _should_accept_session_context_length_refresh(
+                    _persisted_cl,
+                    _fb_cl,
+                    model_changed=_model_changed_for_context,
+                ):
                     if _persisted_cl and _fb_cl != _persisted_cl:
                         # The old threshold belongs to the old window. Hiding it
-                        # is less misleading than rendering a stale compression
-                        # threshold against a freshly resolved context length.
-                        _threshold_tokens = 0
+                        # is less useful than keeping the same compression ratio
+                        # against the freshly resolved context length.
+                        _threshold_tokens = _rescale_threshold_tokens_for_context_window(
+                            _threshold_tokens,
+                            _persisted_cl,
+                            _fb_cl,
+                        )
                     _persisted_cl = _fb_cl
             _session_tool_calls = getattr(s, "tool_calls", []) if load_messages else []
             # Always include session-level tool_calls so the browser can merge
@@ -7200,6 +7745,7 @@ def handle_get(handler, parsed) -> bool:
                 "pending_user_message": getattr(s, "pending_user_message", None),
                 "pending_attachments": getattr(s, "pending_attachments", []) if load_messages else [],
                 "pending_started_at": getattr(s, "pending_started_at", None),
+                "pending_user_source": getattr(s, "pending_user_source", None),
                 "context_length": _persisted_cl,
                 "threshold_tokens": _threshold_tokens,
                 "last_prompt_tokens": getattr(s, "last_prompt_tokens", 0) or 0,
@@ -7862,97 +8408,7 @@ def handle_get(handler, parsed) -> bool:
 
     # ── Gateway Status (GET) ──
     if parsed.path == "/api/gateway/status":
-        import datetime
-        identity_map = _load_gateway_session_identity_map()
-        sessions_path = _gateway_session_metadata_path()
-
-        # Detect whether the gateway process is alive, independent of
-        # connected messaging platforms.  An empty identity_map just
-        # means zero platforms connected, not that the gateway is down.
-        #
-        # agent_health.build_agent_health_payload() is the authoritative
-        # signal: it reads gateway.status runtime metadata and returns a
-        # tri-state `alive` field (True/False/None).  This avoids the
-        # false-negative where the gateway is running but has zero active
-        # messaging sessions (empty identity_map).
-        #
-        # `alive` tri-state semantics:
-        #   True  → gateway process is alive
-        #   False → gateway metadata exists but process is down
-        #   None  → no gateway metadata/status available; this WebUI
-        #           setup is probably not configured with a gateway
-        health = build_agent_health_payload()
-        alive = health.get("alive")
-        details = health.get("details") if isinstance(health.get("details"), dict) else {}
-        health_reason = details.get("reason")
-        health_state = details.get("state")
-        health_gateway_state = details.get("gateway_state")
-        if alive is True:
-            running = True
-            configured = True
-        elif alive is False:
-            running = False
-            configured = True
-        else:  # alive is None
-            # `alive is None` conflates two very different states:
-            #   (a) no gateway metadata at all → genuinely not configured
-            #   (b) gateway metadata EXISTS but is stale/inconclusive.
-            # A stale-but-RUNNING gateway (freshly started, hasn't ticked
-            # `updated_at` yet, or cross-container) still proves the gateway is
-            # *configured* — the banner must not report "Gateway not configured"
-            # just because no conversation has happened yet and identity_map is
-            # empty (#3194).
-            #
-            # A stale-STOPPED gateway is deliberately NOT treated as configured:
-            # agent_health emits `gateway_stale_stopped_state` precisely so a
-            # stopped service the user isn't running reads like "no root gateway
-            # configured" rather than nagging (#1944). So stale-stopped falls
-            # through to the identity_map signal like the genuinely-unconfigured
-            # case.
-            gateway_running_metadata = (
-                health_reason == "gateway_stale_running_state"
-                or health_gateway_state == "running"
-            )
-            configured = True if gateway_running_metadata else bool(identity_map)
-            running = bool(identity_map)
-
-        platforms_set: set[str] = set()
-        for meta in identity_map.values():
-            raw = meta.get("raw_source") or meta.get("platform") or ""
-            norm = _normalize_messaging_source(raw)
-            if norm:
-                platforms_set.add(norm)
-        _PLATFORM_LABELS = {
-            "telegram": "Telegram",
-            "discord": "Discord",
-            "slack": "Slack",
-            "email": "Email",
-            "web": "Web",
-            "api": "API",
-        }
-        platforms = sorted(
-            [{"name": p, "label": _PLATFORM_LABELS.get(p, p.title())} for p in platforms_set],
-            key=lambda x: x["label"],
-        )
-        last_active = ""
-        if running and sessions_path.exists():
-            try:
-                mtime = sessions_path.stat().st_mtime
-                last_active = datetime.datetime.fromtimestamp(mtime).isoformat()
-            except Exception:
-                pass
-        return j(handler, {
-            "running": running,
-            "configured": configured,
-            "platforms": platforms,
-            "last_active": last_active,
-            "session_count": len(identity_map),
-            "health": {
-                "state": health_state,
-                "reason": health_reason,
-                "gateway_state": health_gateway_state,
-            },
-        })
+        return j(handler, _gateway_status_payload())
 
     # ── MCP Servers (GET) ──
     if parsed.path == "/api/mcp/servers":
@@ -8148,6 +8604,16 @@ def _require_passkey_registration_auth(handler) -> tuple[bool, str, int]:
         return False, "Authentication required", 401
     return True, "", 200
 
+def _validate_session_toolsets_shape(toolsets):
+    """Validate per-session toolset override shape without catalog lookup."""
+    if toolsets is None:
+        return None
+    if not isinstance(toolsets, list) or not toolsets:
+        raise ValueError("toolsets must be a non-empty list or null")
+    if not all(isinstance(t, str) and t for t in toolsets):
+        raise ValueError("each toolset must be a non-empty string")
+    return toolsets
+
 def handle_post(handler, parsed) -> bool:
     """Handle all POST routes. Returns True if handled, False for 404."""
     diag = RequestDiagnostics.maybe_start("POST", parsed.path, logger=logger)
@@ -8313,6 +8779,10 @@ def handle_post(handler, parsed) -> bool:
             body.get("model"),
             body.get("model_provider"),
         )
+        try:
+            enabled_toolsets = _validate_session_toolsets_shape(body.get("enabled_toolsets"))
+        except ValueError as e:
+            return bad(handler, str(e), status=400)
         # Use the profile sent by the client tab (if any) so that two tabs on
         # different profiles never clobber each other via the process-level global.
         # ── Memory lifecycle: commit the previous session before starting a new one ──
@@ -8336,6 +8806,7 @@ def handle_post(handler, parsed) -> bool:
             profile=body.get("profile") or None,
             project_id=body.get("project_id") or None,
             worktree_info=worktree_info,
+            enabled_toolsets=enabled_toolsets,
         )
         if worktree_info:
             publish_session_list_changed(
@@ -8655,12 +9126,10 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, str(e))
         sid = body["session_id"]
         toolsets = body.get("toolsets")
-        # Validate: if not None, must be a non-empty list of strings
-        if toolsets is not None:
-            if not isinstance(toolsets, list) or not toolsets:
-                return bad(handler, "toolsets must be a non-empty list or null")
-            if not all(isinstance(t, str) and t for t in toolsets):
-                return bad(handler, "each toolset must be a non-empty string")
+        try:
+            toolsets = _validate_session_toolsets_shape(toolsets)
+        except ValueError as e:
+            return bad(handler, str(e), status=400)
         try:
             s = get_session(sid)
         except KeyError:
@@ -9362,6 +9831,9 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/memory/write":
         return _handle_memory_write(handler, body)
 
+    if parsed.path in {"/api/gateway/start", "/api/gateway/stop", "/api/gateway/restart"}:
+        return _handle_gateway_lifecycle(handler, parsed.path.rsplit("/", 1)[-1], body)
+
     # ── Profile API (POST) ──
     if parsed.path == "/api/profile/switch":
         name = body.get("name", "").strip()
@@ -9514,6 +9986,28 @@ def handle_post(handler, parsed) -> bool:
 
         saved = save_settings(body)
         saved.pop("password_hash", None)  # never expose hash to client
+
+        # Settings that change which sessions appear in the sidebar must
+        # invalidate the session-list cache directly. Relying on the cache's
+        # settings-file mtime stamp is fragile: a toggle that writes the
+        # settings file within the same mtime granularity as a cached entry (and
+        # produces the default-valued key, e.g. show_cli_sessions back to its
+        # True default) can leave a stale row set served for up to the cache TTL.
+        # This is the root cause of the intermittent gateway_sync test flake
+        # (a freshly-inserted CLI/gateway session occasionally absent from
+        # /api/sessions right after the visibility toggle). Invalidate explicitly.
+        if any(
+            k in body
+            for k in (
+                "show_cli_sessions",
+                "show_cron_sessions",
+                "show_previous_messaging_sessions",
+            )
+        ):
+            try:
+                _clear_session_list_cache()
+            except Exception:
+                pass
 
         auth_enabled_after = is_auth_enabled()
         auth_just_enabled = bool(
@@ -9708,7 +10202,7 @@ def handle_post(handler, parsed) -> bool:
                     created_at=cli_meta.get("created_at"),
                     updated_at=cli_meta.get("updated_at"),
                 )
-                s.is_cli_session = True
+                s.is_cli_session = is_cli_session_row(cli_meta)
                 s.source_tag = cli_meta.get("source_tag")
                 s.raw_source = cli_meta.get("raw_source") or cli_meta.get("source_tag")
                 s.session_source = cli_meta.get("session_source")
@@ -9733,7 +10227,7 @@ def handle_post(handler, parsed) -> bool:
                     created_at=cli_meta.get("created_at"),
                     updated_at=cli_meta.get("updated_at"),
                 )
-                s.is_cli_session = True
+                s.is_cli_session = is_cli_session_row(cli_meta)
                 s.source_tag = cli_meta.get("source_tag")
                 s.raw_source = cli_meta.get("raw_source") or cli_meta.get("source_tag")
                 s.session_source = cli_meta.get("session_source")
@@ -13652,7 +14146,7 @@ def _handle_background(handler, body):
     return j(handler, {"task_id": task_id, "stream_id": stream_id, "session_id": bg.session_id})
 
 
-def _checkpoint_user_message_for_eager_session_save(s, msg: str, attachments, started_at: float | None) -> None:
+def _checkpoint_user_message_for_eager_session_save(s, msg: str, attachments, started_at: float | None, source: str = "webui") -> None:
     """Materialize the current user turn for eager first-turn persistence.
 
     The streaming thread still receives ``pending_user_message`` so existing
@@ -13670,6 +14164,8 @@ def _checkpoint_user_message_for_eager_session_save(s, msg: str, attachments, st
             if latest_text == msg_text:
                 return
     user_msg = {"role": "user", "content": msg}
+    if source and source != "webui":
+        user_msg["_source"] = source
     if isinstance(started_at, (int, float)) and started_at > 0:
         user_msg["timestamp"] = int(started_at)
     if attachments:
@@ -13707,6 +14203,7 @@ def _prepare_chat_start_session_for_stream(
     model_provider,
     stream_id: str,
     started_at: float | None = None,
+    source: str = "webui",
 ):
     """Persist chat-start state according to webui.session_save_mode.
 
@@ -13724,6 +14221,7 @@ def _prepare_chat_start_session_for_stream(
     s.pending_user_message = msg
     s.pending_attachments = attachments
     s.pending_started_at = started_at if started_at is not None else time.time()
+    s.pending_user_source = source
     current_title = getattr(s, "title", None)
     if _is_default_or_empty_session_title(current_title):
         provisional_title = _provisional_title_from_prompt(msg, current_title or "Untitled")
@@ -13735,6 +14233,7 @@ def _prepare_chat_start_session_for_stream(
             msg,
             attachments,
             s.pending_started_at,
+            source=source,
         )
     s.save()
 
@@ -13810,8 +14309,17 @@ def _active_run_stream_for_session(session_id: str | None) -> str | None:
     now = time.time()
     try:
         from api import config as _live_config
+        # Snapshot the live-worker set BEFORE taking ACTIVE_RUNS_LOCK (sequential,
+        # not nested, so no lock-ordering/deadlock risk). A long turn whose
+        # active_stream_id was already cleared during final writeback can still be
+        # mid-teardown — its STREAMS entry present — past the age ceiling, so age
+        # alone must NOT pop its lifecycle row (health / background-wakeup /
+        # active-agent-cache consumers read ACTIVE_RUNS as worker-lifecycle truth).
+        with _live_config.STREAMS_LOCK:
+            live_stream_ids = set(_live_config.STREAMS.keys())
+        stale_stream_ids = []
         with _live_config.ACTIVE_RUNS_LOCK:
-            for run_stream_id, raw in (_live_config.ACTIVE_RUNS or {}).items():
+            for run_stream_id, raw in list((_live_config.ACTIVE_RUNS or {}).items()):
                 stream_id = str((raw or {}).get("stream_id") or run_stream_id or "").strip()
                 run_sid = str((raw or {}).get("session_id") or "").strip()
                 if run_sid != sid or not stream_id:
@@ -13820,11 +14328,19 @@ def _active_run_stream_for_session(session_id: str | None) -> str | None:
                     started_at = float((raw or {}).get("started_at") or 0)
                 except (TypeError, ValueError):
                     started_at = 0.0
-                # Ignore a stale/wedged entry past the unwind ceiling so it can't
-                # block the session permanently.
+                # Past the unwind ceiling: never block a successor on it (the
+                # anti-permanent-409 guarantee, #3822). Additionally reconcile the
+                # zombie out of ACTIVE_RUNS so health/recovery polling stops seeing a
+                # half-alive run — but ONLY when the worker is truly gone from
+                # STREAMS, so a still-live / still-tearing-down worker keeps its
+                # lifecycle row. Pop by the real dict key. (Codex gate, #4492)
                 if started_at and (now - started_at) > ceiling:
+                    if run_stream_id not in live_stream_ids and stream_id not in live_stream_ids:
+                        stale_stream_ids.append(run_stream_id)
                     continue
                 return stream_id
+            for stale_stream_id in stale_stream_ids:
+                (_live_config.ACTIVE_RUNS or {}).pop(stale_stream_id, None)
     except Exception:
         return None
     return None
@@ -13841,6 +14357,7 @@ def _start_chat_stream_for_session(
     normalized_model: bool = False,
     diag=None,
     goal_related: bool = False,
+    source: str = "webui",
 ):
     """Persist pending state, register an SSE channel, and start an agent turn."""
     attachments = attachments or []
@@ -13911,6 +14428,7 @@ def _start_chat_stream_for_session(
                     model=model,
                     model_provider=model_provider,
                     stream_id=stream_id,
+                    source=source,
                 )
                 break
         if needs_stale_cleanup:
@@ -14087,6 +14605,7 @@ def _start_run(
                 model_provider=request.provider or model_provider,
                 normalized_model=normalized_model,
                 diag=diag,
+                source=request.source or source,
             )
 
         def _legacy_adapter_factory():
@@ -14125,6 +14644,7 @@ def _start_run(
         model_provider=model_provider,
         normalized_model=normalized_model,
         diag=diag,
+        source=source,
     )
 
 
@@ -14734,6 +15254,7 @@ def _handle_chat_sync(handler, body):
             _previous_context_messages,
             _restore_display_reasoning_metadata(_previous_messages, _result_messages),
             msg,
+            source=getattr(s, "pending_user_source", None) or "webui",
         )
         # Only auto-generate title when still default; preserves user renames
         if s.title == "Untitled":
@@ -16535,6 +17056,7 @@ def _handle_session_compress(handler, body):
             s.pending_user_message = None
             s.pending_attachments = []
             s.pending_started_at = None
+            s.pending_user_source = None
             visible_after = visible_messages_for_anchor(compressed, auto_compression=False)
             s.compression_anchor_visible_idx = max(0, len(visible_after) - 1) if visible_after else None
             s.compression_anchor_message_key = _anchor_message_key(visible_after[-1]) if visible_after else None
@@ -17390,7 +17912,24 @@ def _handle_memory_write(handler, body):
     # (#4217/#4234/#4240).
     if target.is_symlink():
         return bad(handler, "Cannot write to a symlinked memory file")
-    target.write_text(body["content"], encoding="utf-8")
+    try:
+        target.write_text(body["content"], encoding="utf-8")
+    except OSError as exc:
+        if not isinstance(exc, PermissionError) and getattr(exc, "errno", None) != errno.EROFS:
+            raise
+        mode_hint = ""
+        try:
+            mode_hint = f" (mode {target.stat().st_mode & 0o777:o})"
+        except OSError:
+            pass
+        return bad(
+            handler,
+            (
+                f"{target.name} is not writable{mode_hint}: {target}. "
+                "Run chmod 644 on the file or fix ownership on the shared volume."
+            ),
+            403,
+        )
     return j(handler, {"ok": True, "section": section, "path": str(target)})
 
 
