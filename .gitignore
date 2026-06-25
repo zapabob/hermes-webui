@@ -70,3 +70,6 @@ graphify-out/
 node_modules/
 package-lock.json
 docs/ui-ux/review-shots/
+
+# Upstream merge tooling checkpoint (scripts/merge_official_updates.py)
+.hermes-webui-merge-checkpoint.json

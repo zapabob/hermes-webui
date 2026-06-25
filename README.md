@@ -48,12 +48,13 @@ This gives you nearly **1:1 parity with Hermes CLI from a convenient web UI** wh
 ## Local fork highlights
 
 This fork tracks the official `nesquena/hermes-webui` API and release stream,
-with the current merge including upstream `v0.51.477`. Local changes are kept
-small and operational:
+with the current merge including upstream `v0.51.520` (official latest analyzed:
+`v0.51.660`). Local changes are kept small and operational:
 
 - **Official-first merge flow:** `scripts/merge_official_updates.py` fetches the
   official upstream, summarizes local-only and upstream-only commits, previews
-  conflicts, and then runs the merge so future updates stay repeatable.
+  conflicts with fork-specific resolution hints, checkpoints each phase for
+  recovery, and then runs the merge so future updates stay repeatable.
 - **OpenClaw bridge compatibility:** a shared `OPENCODE_API_KEY` now enables
   both OpenCode Zen and OpenCode Go provider groups, while the existing
   official `OPENCODE_ZEN_API_KEY` and `OPENCODE_GO_API_KEY` paths continue to

@@ -4,6 +4,7 @@
 
 ### Added
 
+- Enhance `scripts/merge_official_updates.py` with tqdm progress, JSON checkpoint/recovery (`--resume`, `--abort`), fork-specific conflict guidance, and automatic `upstream` remote detection on Windows.
 - Add scripts/merge_official_updates.py for repeatable official upstream fetch/merge runs while preserving local commits.
 - Highlight this fork's local upstream-merge, OpenClaw/OpenCode, and native Windows wrapper differences in README.md.
 - Native Windows wrapper now injects HERMES_WEBUI_PASSWORD at launch from the process environment, HERMES_WEBUI_PASSWORD_FILE, HERMES_HOME\.env, or the legacy WebUI .env, and can open the browser with -Open or HERMES_WEBUI_OPEN_ON_START=1.
