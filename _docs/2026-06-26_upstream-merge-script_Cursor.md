@@ -164,3 +164,19 @@ $env:HERMES_WEBUI_STATE_DIR = Join-Path $env:TEMP "hermes-webui-merge-test\state
 5. Smoke-test Irodori TTS, OpenCode provider detection, and Windows native launcher
 6. Update fork `[Unreleased]` changelog entry with “Merged official upstream through v0.51.660”
 7. Push to `origin/master` when satisfied
+
+## Completion (2026-06-26, Cursor)
+
+All manual steps above were executed:
+
+| Step | Result |
+|------|--------|
+| Commit merge tooling (`11a1cff0`) | Done |
+| Merge `upstream/master` (`2e913c60`) | Done — through **v0.51.661** |
+| Resolve `CHANGELOG.md` / `CONTRIBUTORS.md` | Done — fork `[Unreleased]` kept; upstream stats adopted |
+| Update `README.md` fork highlights | Done — v0.51.661 |
+| Post-merge dry-run | Clean — no upstream commits pending |
+| `./scripts/test.sh` | **Blocked** — `hermes-agent\venv` missing `pyvenv.cfg` on this host |
+| Push `origin/master` | Pending this session |
+
+Commits pushed: `11a1cff0`, `2e913c60`.
