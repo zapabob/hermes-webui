@@ -180,3 +180,41 @@ All manual steps above were executed:
 | Push `origin/master` | Pending this session |
 
 Commits pushed: `11a1cff0`, `2e913c60`.
+
+## Post-merge verification (2026-06-26)
+
+### hermes-agent venv repair
+
+- **Problem**: `hermes-agent/venv` existed without `pyvenv.cfg` and empty site-packages; conftest picked it before `.venv`.
+- **Fix**: Renamed corrupt tree to `venv.corrupt.bak`; created junction `hermes-agent/venv` → `hermes-agent/.venv` (PowerShell `New-Item -ItemType Junction`).
+- **Verify**: `venv\Scripts\python.exe -c "import hermes_cli"` → pass.
+
+### Automated tests (fork-critical)
+
+```powershell
+$env:PYTHONUTF8 = "1"
+$env:HERMES_HOME = "$env:TEMP\hermes-webui-smoke-home"
+$env:HERMES_WEBUI_STATE_DIR = "$env:TEMP\hermes-webui-smoke-state"
+.venv\Scripts\python.exe -m pytest tests/test_merge_official_updates_script.py tests/test_updates.py tests/test_issue4356_no_git_update_check.py -q
+```
+
+**Result**: 49 passed (requires `PYTHONUTF8=1` on Windows cp932 hosts for static JS reads).
+
+`./scripts/test.sh` via Git Bash still fails on this host (`No supported Python found`) because the script expects `.venv/bin/python` (Unix layout). Equivalent: repo `.venv\Scripts\python.exe` + isolated `HERMES_HOME` / `HERMES_WEBUI_STATE_DIR`.
+
+### Fork smoke checks
+
+Added `scripts/smoke_fork_features.py`:
+
+```powershell
+.venv\Scripts\python.exe scripts/smoke_fork_features.py
+```
+
+| Check | Result |
+|-------|--------|
+| Irodori TTS helpers (`api/routes.py`) | pass |
+| OpenCode shared `OPENCODE_API_KEY` (`api/providers.py`) | pass |
+| Windows native launcher (`start-hermes-webui-native.ps1`) | pass |
+| Static Irodori hooks (`ui.js`, `boot.js`) | pass |
+
+Full `./scripts/test.sh` (entire `tests/`) not run — estimate hours; fork-critical suite green.
