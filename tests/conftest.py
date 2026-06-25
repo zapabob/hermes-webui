@@ -1098,6 +1098,11 @@ def cleanup_test_sessions():
         _post(TEST_BASE, "/api/settings", {"show_cli_sessions": False})
     except Exception:
         pass
+    try:
+        from api.models import clear_cli_sessions_cache
+        clear_cli_sessions_cache()
+    except Exception:
+        pass
     yield created
 
     for sid in created:
@@ -1121,6 +1126,11 @@ def cleanup_test_sessions():
     # across tests (33 gateway_sync tests flip it on; only ~30 reset it).
     try:
         _post(TEST_BASE, "/api/settings", {"show_cli_sessions": False})
+    except Exception:
+        pass
+    try:
+        from api.models import clear_cli_sessions_cache
+        clear_cli_sessions_cache()
     except Exception:
         pass
 
