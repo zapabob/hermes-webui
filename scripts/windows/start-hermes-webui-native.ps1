@@ -134,7 +134,14 @@ Start-Process `$url
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $ProjectRoot = Resolve-Path (Join-Path $RepoRoot "..")
 $AgentDir = Join-Path $ProjectRoot "hermes-agent"
-$AgentPython = Join-Path $AgentDir "venv\Scripts\python.exe"
+$AgentPythonCandidates = @(
+    (Join-Path $AgentDir ".venv\Scripts\python.exe"),
+    (Join-Path $AgentDir "venv\Scripts\python.exe")
+)
+$AgentPython = $AgentPythonCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+if (-not $AgentPython) {
+    $AgentPython = $AgentPythonCandidates[0]
+}
 $HermesHome = Get-HermesHome
 $LogDir = Join-Path $HermesHome "logs"
 $WebUiEnvPath = Join-Path $RepoRoot ".env"
@@ -147,7 +154,6 @@ $env:HERMES_WEBUI_HOST = $BindHost
 $env:HERMES_WEBUI_PORT = "$Port"
 $env:HERMES_WEBUI_STATE_DIR = Join-Path $HermesHome "webui"
 $env:HERMES_WEBUI_DEFAULT_WORKSPACE = $ProjectRoot
-$env:HERMES_WEBUI_DEFAULT_MODEL = "gpt-5.5"
 $env:HERMES_HOME = $HermesHome
 $env:HERMES_CONFIG_PATH = Join-Path $HermesHome "config.yaml"
 $resolvedPassword = Resolve-WebUiPassword -HermesHome $HermesHome -WebUiEnvPath $WebUiEnvPath
@@ -158,7 +164,7 @@ if ($resolvedPassword) {
 }
 
 if (-not (Test-Path -LiteralPath $AgentPython)) {
-    throw "Hermes agent uv venv Python not found: $AgentPython"
+    throw "Hermes agent Python not found. Checked: $($AgentPythonCandidates -join ', ')"
 }
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"

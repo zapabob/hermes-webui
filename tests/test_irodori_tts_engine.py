@@ -121,15 +121,13 @@ def test_irodori_happy_path_streams_mp3(monkeypatch):
         def __exit__(self, *a):
             return False
 
-    def _fake_urlopen(req, timeout=120):
+    def _fake_urlopen(req, **_kw):
         captured["url"] = req.full_url
         captured["auth"] = req.get_header("Authorization")
         captured["body"] = json.loads(req.data.decode("utf-8"))
         return _Resp()
 
-    import urllib.request as _ur
-
-    monkeypatch.setattr(_ur, "urlopen", _fake_urlopen)
+    monkeypatch.setattr(routes, "_tts_open", _fake_urlopen)
 
     h = _post({"text": "こんにちは", "engine": "irodori", "voice": "hakua", "speed": 1.1}, client="9.9.9.3")
     routes._handle_tts(h, None)
@@ -179,13 +177,11 @@ def test_irodori_remote_api_key_not_sent_without_opt_in(monkeypatch):
 
     captured = {}
 
-    def _fake_urlopen(req, timeout=120):
+    def _fake_urlopen(req, **_kw):
         captured["auth"] = req.get_header("Authorization")
         return _Resp()
 
-    import urllib.request as _ur
-
-    monkeypatch.setattr(_ur, "urlopen", _fake_urlopen)
+    monkeypatch.setattr(routes, "_tts_open", _fake_urlopen)
 
     h = _post({"text": "hello", "engine": "irodori"}, client="9.9.9.4")
     routes._handle_tts(h, None)

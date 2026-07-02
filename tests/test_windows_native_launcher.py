@@ -48,6 +48,15 @@ def test_native_launcher_can_open_browser_after_readiness():
     assert "Hidden" in script
 
 
+def test_native_launcher_prefers_dotvenv_without_forcing_default_model():
+    script = _read_launcher()
+
+    assert '".venv\\Scripts\\python.exe"' in script
+    assert '"venv\\Scripts\\python.exe"' in script
+    assert "$AgentPythonCandidates | Where-Object" in script
+    assert "$env:HERMES_WEBUI_DEFAULT_MODEL =" not in script
+
+
 def test_native_launcher_does_not_print_password_value():
     script = _read_launcher()
 
