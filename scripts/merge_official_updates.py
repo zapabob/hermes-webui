@@ -164,6 +164,24 @@ def git_text(args: list[str], repo: Path, check: bool = True) -> str:
     return run_git(args, repo, check=check).stdout.strip()
 
 
+def is_shallow_repository(repo: Path) -> bool:
+    status = git_text(["rev-parse", "--is-shallow-repository"], repo, check=False)
+    return status.strip().lower() == "true"
+
+
+def merge_base(repo: Path, target_name: str) -> str:
+    base = run_git(["merge-base", "HEAD", target_name], repo, check=False)
+    if base.returncode == 0:
+        return base.stdout.strip()
+    if is_shallow_repository(repo):
+        print("Local checkout is shallow; fetching origin history before merge-base.")
+        run_git(["fetch", "--unshallow", "origin"], repo, check=False)
+        base = run_git(["merge-base", "HEAD", target_name], repo, check=False)
+        if base.returncode == 0:
+            return base.stdout.strip()
+    raise subprocess.CalledProcessError(base.returncode, base.args, output=base.stdout, stderr=base.stderr)
+
+
 def ensure_repo(path: Path) -> Path:
     root = git_text(["rev-parse", "--show-toplevel"], path)
     return Path(root)
@@ -388,7 +406,7 @@ def main() -> int:
 
             head = git_text(["rev-parse", "--short", "HEAD"], repo)
             upstream = git_text(["rev-parse", "--short", target_name], repo)
-            base = git_text(["merge-base", "HEAD", target_name], repo)
+            base = merge_base(repo, target_name)
             official_tag = latest_tag(repo, target_name)
             checkpoint.touch(
                 "preview",
