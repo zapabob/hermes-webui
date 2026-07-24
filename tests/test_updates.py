@@ -439,7 +439,7 @@ def test_split_remote_ref_splits_tracking_ref():
 
 
 # ---------------------------------------------------------------------------
-# #2756 — Update check fails with "would clobber existing tag" when an
+# #2756  EUpdate check fails with "would clobber existing tag" when an
 # upstream release tag was moved.
 #
 # All three fetch-tag call sites in api/updates.py must use --force so the
@@ -575,7 +575,7 @@ def test_check_repo_recovers_from_remote_retag(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# #2653 — Update check reports "Up to date" while the repo is hundreds of
+# #2653  EUpdate check reports "Up to date" while the repo is hundreds of
 # commits past the latest tag (agent cadence bug).
 #
 # When current_tag == latest_tag (behind==0 from the release check) but HEAD
@@ -600,7 +600,7 @@ def test_check_repo_release_falls_through_when_head_is_past_tag(tmp_path):
             return 'v2026.5.16', True
         if args == ['describe', '--tags', '--abbrev=0', '--match', 'v*']:
             return 'v2026.5.16', True
-        # HEAD is 608 commits past the tag — describe includes a suffix.
+        # HEAD is 608 commits past the tag  Edescribe includes a suffix.
         if args == ['describe', '--tags', '--always', '--match', 'v*']:
             return 'v2026.5.16-608-g1d22b9c2d', True
         raise AssertionError(f'unexpected git args: {args!r}')
@@ -689,14 +689,14 @@ def test_check_repo_branch_check_runs_for_post_tag_commits(tmp_path):
 # Regression tests for #2846: _select_apply_compare_ref must mirror the
 # check-side decision about whether to advance to the latest tag or to the
 # upstream branch. Pre-fix, the check correctly fell through to the branch
-# count when HEAD was past the latest tag, but apply still aimed at the tag —
+# count when HEAD was past the latest tag, but apply still aimed at the tag  E
 # so clicking "Update Now" no-op'd, restarted the server, and the banner
 # re-appeared with the same N commits.
 # ---------------------------------------------------------------------------
 
 
 def test_select_apply_compare_ref_uses_tag_when_head_is_on_tag(tmp_path):
-    """HEAD == latest tag → apply path advances to the tag (unchanged)."""
+    """HEAD == latest tag ↁEapply path advances to the tag (unchanged)."""
     (tmp_path / '.git').mkdir()
 
     def fake_git(args, cwd, timeout=10):
@@ -715,12 +715,12 @@ def test_select_apply_compare_ref_uses_tag_when_head_is_on_tag(tmp_path):
 
 
 def test_select_apply_compare_ref_falls_through_when_head_is_past_tag(tmp_path):
-    """HEAD past latest tag → apply path advances to origin/<branch>, not the tag.
+    """HEAD past latest tag ↁEapply path advances to origin/<branch>, not the tag.
 
     Mirrors the issue #2846 repro: hermes-agent has tag v2026.5.16, master is
     608 commits ahead, the banner correctly reports 608 commits available
-    (post-#2758), but pre-fix apply ran `git pull --ff-only v2026.5.16` — a
-    no-op — and the banner reappeared after restart.
+    (post-#2758), but pre-fix apply ran `git pull --ff-only v2026.5.16`  Ea
+    no-op  Eand the banner reappeared after restart.
     """
     (tmp_path / '.git').mkdir()
 
@@ -746,7 +746,7 @@ def test_select_apply_compare_ref_falls_through_when_head_is_past_tag(tmp_path):
 
 
 def test_select_apply_compare_ref_no_tags_uses_upstream(tmp_path):
-    """No `v*` tags → apply path uses the configured upstream (unchanged)."""
+    """No `v*` tags ↁEapply path uses the configured upstream (unchanged)."""
     (tmp_path / '.git').mkdir()
 
     def fake_git(args, cwd, timeout=10):
@@ -763,7 +763,7 @@ def test_select_apply_compare_ref_no_tags_uses_upstream(tmp_path):
 
 
 def test_select_apply_compare_ref_no_tags_no_upstream_uses_default_branch(tmp_path):
-    """No tags and no upstream → fall back to origin/<default-branch>."""
+    """No tags and no upstream ↁEfall back to origin/<default-branch>."""
     (tmp_path / '.git').mkdir()
 
     def fake_git(args, cwd, timeout=10):
@@ -785,7 +785,7 @@ def test_check_and_apply_paths_agree_when_head_is_past_tag(tmp_path):
     """Check and apply paths must agree: both fall through to origin/<branch>.
 
     The bug class in #2846 (and #2653 before it) was the two paths drifting
-    apart — check said "you're 608 behind origin/main", apply said "advance
+    apart  Echeck said "you're 608 behind origin/main", apply said "advance
     to v2026.5.16". This test pins the symmetry so they can't drift again.
     """
     (tmp_path / '.git').mkdir()
@@ -805,7 +805,7 @@ def test_check_and_apply_paths_agree_when_head_is_past_tag(tmp_path):
         check_result = updates._check_repo_release(tmp_path, 'agent')
         apply_ref = updates._select_apply_compare_ref(tmp_path, 'stable', 'agent')
 
-    # Check side falls through (release check returns None → branch check runs)
+    # Check side falls through (release check returns None ↁEbranch check runs)
     assert check_result is None, (
         '_check_repo_release should fall through when HEAD is past the latest '
         'tag (#2653)'
@@ -870,14 +870,14 @@ def test_select_apply_compare_ref_falls_through_when_head_contains_newer_tag(tmp
 
 
 def test_select_apply_compare_ref_case_d_older_tag_with_commits_and_newer_tag_exists(tmp_path):
-    """Case D — HEAD on older tag + commits + newer tag exists → advance to newer tag.
+    """Case D  EHEAD on older tag + commits + newer tag exists ↁEadvance to newer tag.
 
     Pre-Opus-#2855-fix: the check side correctly reported "behind by N" and
     suggested `latest_tag`, but the apply side's predicate consulted
     `_head_is_past_latest_tag(path, latest_tag)` which returned True (because
     `git describe --tags --always` returns `v.older-N-g...` ≠ `latest_tag`).
     So the apply side fell through to `origin/<branch>` and the pull landed
-    PAST the advertised tag — silent drift between check ("advance to
+    PAST the advertised tag  Esilent drift between check ("advance to
     v2026.5.16") and apply ("pulled to whatever origin/main is now").
 
     Fix: the apply-side predicate now uses `current_tag` (HEAD's nearest tag)
@@ -904,7 +904,7 @@ def test_select_apply_compare_ref_case_d_older_tag_with_commits_and_newer_tag_ex
     with patch.object(updates, '_run_git', side_effect=fake_git):
         apply_ref = updates._select_apply_compare_ref(tmp_path)
 
-    # User is genuinely behind v2026.5.16 (the newer published tag) — apply
+    # User is genuinely behind v2026.5.16 (the newer published tag)  Eapply
     # MUST advance to the tag, NOT fall through to origin/<branch>.
     assert apply_ref == 'v2026.5.16', (
         'case D: HEAD on older tag with commits + newer tag exists. Apply '
@@ -1210,7 +1210,7 @@ def test_apply_clear_lock_with_no_lock_runs_normal_update(tmp_path, monkeypatch)
     )
     monkeypatch.setattr(
         updates, '_select_apply_compare_ref',
-        lambda path, channel='stable', target=None: 'origin/main'
+        lambda path, channel='stable', target=None, *, require_remote_tag=False: 'origin/main'
     )
     result = updates.apply_clear_lock('webui')
     assert result['ok'] is True, result
@@ -1327,7 +1327,7 @@ def test_apply_update_pull_lock_restores_stash(tmp_path, monkeypatch):
     monkeypatch.setattr(updates, 'REPO_ROOT', tmp_path)
     monkeypatch.setattr(
         updates, '_select_apply_compare_ref',
-        lambda path, channel='stable', target=None: 'origin/main'
+        lambda path, channel='stable', target=None, *, require_remote_tag=False: 'origin/main'
     )
 
     result = updates._apply_update_inner('webui')
@@ -1379,7 +1379,7 @@ def test_apply_update_pull_lock_no_stash_when_clean(tmp_path, monkeypatch):
     monkeypatch.setattr(updates, 'REPO_ROOT', tmp_path)
     monkeypatch.setattr(
         updates, '_select_apply_compare_ref',
-        lambda path, channel='stable', target=None: 'origin/main'
+        lambda path, channel='stable', target=None, *, require_remote_tag=False: 'origin/main'
     )
 
     result = updates._apply_update_inner('webui')

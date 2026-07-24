@@ -1,7 +1,7 @@
 """End-to-end tests for update channels (stable vs experimental).
 
 These use REAL git repositories in tmp_path (not mocked _run_git) so they
-exercise the actual git commands the channel logic depends on — the tag globs,
+exercise the actual git commands the channel logic depends on  Ethe tag globs,
 `describe --match`, and the ancestor/descendant merge-base checks. This is the
 durable regression proof for the two-tag-channel design:
 
@@ -138,14 +138,14 @@ def test_experimental_user_sees_unpromoted_exp_commit(channel_repo):
 # ── Agent repo keeps historical fall-through (channel is webui-only) ─────────
 
 def test_agent_repo_falls_through_to_branch_even_on_stable(channel_repo):
-    """The agent repo legitimately tracks master past its tags — the stable
+    """The agent repo legitimately tracks master past its tags  Ethe stable
     channel's fall-through suppression is webui-only, so the agent still
     branch-compares when HEAD is past the latest tag."""
     # Add commits past the latest stable tag WITHOUT promoting them, and set an
     # upstream so the branch path is reachable.
     _git(channel_repo, 'commit', '-q', '--allow-empty', '-m', 'past1')
     _git(channel_repo, 'commit', '-q', '--allow-empty', '-m', 'past2')
-    # name='agent' → suppression OFF → past-tag HEAD returns None (fall through).
+    # name='agent' ↁEsuppression OFF ↁEpast-tag HEAD returns None (fall through).
     result = updates._check_repo_release(channel_repo, 'agent', 'stable')
     assert result is None, 'agent must fall through to branch check when past its tag'
 
@@ -153,7 +153,7 @@ def test_agent_repo_falls_through_to_branch_even_on_stable(channel_repo):
 def test_agent_resolution_identical_under_both_webui_channels(tmp_path, monkeypatch):
     """Codex gate: the update CHANNEL is WebUI-only. An Agent repo that tags only
     plain v* must resolve release/apply IDENTICALLY whether the user's WebUI
-    channel is 'stable' or 'experimental' — the webui channel must never leak
+    channel is 'stable' or 'experimental'  Ethe webui channel must never leak
     into the agent check (which would make the agent ignore its v* tags and fall
     back to origin/master)."""
     agent = tmp_path / 'agent'
@@ -181,14 +181,14 @@ def test_agent_resolution_identical_under_both_webui_channels(tmp_path, monkeypa
     fresh_cache()
     experimental = updates.check_for_updates(force=True, include_agent=True, channel='experimental')['agent']
 
-    # Agent must resolve its v1.0.3 release identically on both — never None /
+    # Agent must resolve its v1.0.3 release identically on both  Enever None /
     # origin/master (which is what leaking 'experimental' into the agent caused).
     assert stable.get('latest_version') == 'v1.0.3'
     assert experimental.get('latest_version') == 'v1.0.3'
     assert stable.get('behind') == experimental.get('behind') == 1
     # Apply-ref selection for the agent is channel-independent because the apply
     # wrappers force DEFAULT_UPDATE_CHANNEL for target=='agent'. Verified at the
-    # raw layer with the default (stable) channel — the agent's v* tag resolves.
+    # raw layer with the default (stable) channel  Ethe agent's v* tag resolves.
     assert updates._select_apply_compare_ref(agent, 'stable', 'agent') == 'v1.0.3'
 
 
@@ -206,7 +206,7 @@ def test_force_update_refuses_rewind_when_ref_is_ancestor(channel_repo, monkeypa
     # Force the compare ref to the older stable tag (a strict ancestor of HEAD).
     monkeypatch.setattr(
         updates, '_select_apply_compare_ref',
-        lambda path, channel='stable', target=None: 'v0.52.2',
+        lambda path, channel='stable', target=None, *, require_remote_tag=False: 'v0.52.2',
     )
     real_run_git = updates._run_git
 
@@ -254,7 +254,7 @@ def test_update_cache_scoped_by_channel(channel_repo, monkeypatch):
 
 def test_clear_lock_retry_preserves_experimental_channel(tmp_path, monkeypatch):
     """apply_clear_lock re-runs the normal update once the lock is gone. It must
-    pass the configured channel through — otherwise an experimental WebUI
+    pass the configured channel through  Eotherwise an experimental WebUI
     lock-recovery retry silently falls back to stable (_apply_update_inner
     defaults to stable)."""
     (tmp_path / '.git').mkdir()
@@ -263,7 +263,7 @@ def test_clear_lock_retry_preserves_experimental_channel(tmp_path, monkeypatch):
         updates, '_restart_blocker_snapshot',
         lambda: {'restart_blocked': False, 'active_streams': 0, 'active_runs': 0},
     )
-    # No lock present → clear-lock takes the "re-run normal update" branch.
+    # No lock present ↁEclear-lock takes the "re-run normal update" branch.
     monkeypatch.setattr(
         updates, '_inventory_locks',
         lambda path: {'well_known_lock_present': False,
@@ -291,7 +291,7 @@ def test_clear_lock_retry_preserves_experimental_channel(tmp_path, monkeypatch):
 #
 # b3nw's report: a plain stable install pinned on v0.52.0 that flips to the
 # Experimental channel. Unlike `channel_repo` (which tags stable and exp on the
-# SAME commits), here the stable tag PREDATES every exp-v* tag — so from HEAD ==
+# SAME commits), here the stable tag PREDATES every exp-v* tag  Eso from HEAD ==
 # v0.52.0 there is NO exp-v* tag reachable behind HEAD. Both channel-scoped git
 # lookups then degrade: the chip `describe --always` leaks a bare SHA, and the
 # banner `describe --abbrev=0` fatals -> current_version=None -> "unknown".
@@ -363,7 +363,7 @@ def test_count_channel_tags_ahead(stable_pinned_repo):
     """The ahead-count helper: 3 exp-v* tags sit ahead of a v0.52.0 HEAD.
 
     This helper is only ever CALLED when no channel tag is reachable on/behind
-    HEAD (current_tag is None) — exactly the experimental case here, where no
+    HEAD (current_tag is None)  Eexactly the experimental case here, where no
     exp-v* tag sits on the v0.52.0 commit, so `--contains HEAD` counts precisely
     the 3 tags strictly ahead.
     """
@@ -373,7 +373,7 @@ def test_count_channel_tags_ahead(stable_pinned_repo):
 
 def test_stable_pinned_experimental_agent_repo_does_not_inject_webui_version(stable_pinned_repo, monkeypatch):
     """#5864: the installed-version fallback is WebUI-only. _check_repo_release is
-    shared with the Agent repo, where WEBUI_VERSION (v0.52.0) is not a valid ref —
+    shared with the Agent repo, where WEBUI_VERSION (v0.52.0) is not a valid ref  E
     it must NOT be injected as the Agent's current_version/current_sha (that would
     show the WebUI version as the Agent's and emit a broken Agent compare link)."""
     monkeypatch.setattr(updates, 'WEBUI_VERSION', 'v0.52.0')
@@ -390,7 +390,7 @@ def test_stable_pinned_experimental_current_sha_is_verified_ref_only(stable_pinn
     tag, current_sha resolves to that tag; when WEBUI_VERSION is a non-ref dirty
     string, the compare ref falls back to None (no broken /compare link) while the
     displayed version still shows the real installed string."""
-    # HEAD is exactly on v0.52.0 → verified tag resolves for the compare link.
+    # HEAD is exactly on v0.52.0 ↁEverified tag resolves for the compare link.
     monkeypatch.setattr(updates, 'WEBUI_VERSION', 'v0.52.0-dirty-deadbeef')
     info = updates._check_repo_release(stable_pinned_repo, 'webui', 'experimental')
     assert info is not None
