@@ -5,7 +5,7 @@
 
 ### Fork Changed
 
-- Merged official upstream through v0.51.900 while preserving fork-only launch, OpenCode conveniences, Irodori TTS, and remote-tag-aware update checks.
+- Merged official upstream through v0.51.823 (tip includes #6350 collapsed wakeup cards) while preserving fork-only launch, OpenCode conveniences, Irodori TTS, and remote-tag-aware update checks.
 
 ### Fork Fixed
 
