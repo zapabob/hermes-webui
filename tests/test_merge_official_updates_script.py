@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -91,4 +92,7 @@ def test_merge_script_dry_run_smoke():
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Dry run complete" in result.stdout
-    assert "v0.51." in result.stdout
+    assert re.search(
+        r"Official upstream/master: [0-9a-f]+ \((?:exp-)?v\d+\.\d+\.\d+\)",
+        result.stdout,
+    )

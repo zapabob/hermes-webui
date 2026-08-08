@@ -414,6 +414,7 @@ def test_force_update_cleans_dirty_stable_checkout_without_changing_head(tmp_pat
     restart = MagicMock()
     monkeypatch.setattr(updates, '_schedule_restart', restart)
     monkeypatch.setattr(updates, '_run_git', no_fetch)
+    monkeypatch.setattr(updates, '_remote_has_tag', lambda *args, **kwargs: True)
 
     result = updates.apply_force_update('webui', channel='stable')
     status, status_ok = real_run_git(['status', '--porcelain'], repo)
@@ -458,7 +459,7 @@ def test_force_update_clean_stable_no_ref_is_an_exact_noop(tmp_path, monkeypatch
         updates, '_restart_blocker_snapshot',
         lambda: {'restart_blocked': False, 'active_streams': 0, 'active_runs': 0},
     )
-    monkeypatch.setattr(updates, '_select_apply_compare_ref', lambda *args: None)
+    monkeypatch.setattr(updates, '_select_apply_compare_ref', lambda *args, **kwargs: None)
     monkeypatch.setattr(updates, '_probe_dirty', dirty)
     monkeypatch.setattr(updates, '_run_git', fake_git)
     restart = MagicMock()
@@ -498,7 +499,7 @@ def test_force_update_dirty_probe_error_keeps_stable_no_ref_as_an_exact_noop(tmp
         updates, '_restart_blocker_snapshot',
         lambda: {'restart_blocked': False, 'active_streams': 0, 'active_runs': 0},
     )
-    monkeypatch.setattr(updates, '_select_apply_compare_ref', lambda *args: None)
+    monkeypatch.setattr(updates, '_select_apply_compare_ref', lambda *args, **kwargs: None)
     monkeypatch.setattr(updates, '_run_git', fake_git)
     restart = MagicMock()
     monkeypatch.setattr(updates, '_schedule_restart', restart)
@@ -541,7 +542,7 @@ def test_force_update_dirty_probe_timeout_keeps_stable_no_ref_as_an_exact_noop(
         updates, '_restart_blocker_snapshot',
         lambda: {'restart_blocked': False, 'active_streams': 0, 'active_runs': 0},
     )
-    monkeypatch.setattr(updates, '_select_apply_compare_ref', lambda *args: None)
+    monkeypatch.setattr(updates, '_select_apply_compare_ref', lambda *args, **kwargs: None)
     monkeypatch.setattr(updates, '_run_git', fake_git)
     restart = MagicMock()
     monkeypatch.setattr(updates, '_schedule_restart', restart)
@@ -586,7 +587,7 @@ def test_force_update_dirty_probe_non_dirty_status_keeps_stable_no_ref_as_an_exa
         updates, '_restart_blocker_snapshot',
         lambda: {'restart_blocked': False, 'active_streams': 0, 'active_runs': 0},
     )
-    monkeypatch.setattr(updates, '_select_apply_compare_ref', lambda *args: None)
+    monkeypatch.setattr(updates, '_select_apply_compare_ref', lambda *args, **kwargs: None)
     monkeypatch.setattr(updates, '_run_git', fake_git)
     restart = MagicMock()
     monkeypatch.setattr(updates, '_schedule_restart', restart)
@@ -637,7 +638,7 @@ def test_force_update_dirty_stable_reset_failure_reports_head(tmp_path, monkeypa
         updates, '_restart_blocker_snapshot',
         lambda: {'restart_blocked': False, 'active_streams': 0, 'active_runs': 0},
     )
-    monkeypatch.setattr(updates, '_select_apply_compare_ref', lambda *args: None)
+    monkeypatch.setattr(updates, '_select_apply_compare_ref', lambda *args, **kwargs: None)
     monkeypatch.setattr(updates, '_run_git', fake_git)
     restart = MagicMock()
     monkeypatch.setattr(updates, '_schedule_restart', restart)
@@ -679,7 +680,7 @@ def test_force_update_clean_failure_preserves_reset_boundary(tmp_path, monkeypat
         updates, '_restart_blocker_snapshot',
         lambda: {'restart_blocked': False, 'active_streams': 0, 'active_runs': 0},
     )
-    monkeypatch.setattr(updates, '_select_apply_compare_ref', lambda *args: 'origin/main')
+    monkeypatch.setattr(updates, '_select_apply_compare_ref', lambda *args, **kwargs: 'origin/main')
     monkeypatch.setattr(updates, '_head_contains_ref', lambda *args: False)
     monkeypatch.setattr(updates, '_run_git', fake_git)
     restart = MagicMock()
