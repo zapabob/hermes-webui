@@ -2,6 +2,8 @@
 
 import io
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
@@ -193,3 +195,88 @@ def test_irodori_remote_api_key_not_sent_without_opt_in(monkeypatch):
 def test_normalize_irodori_base_url_strips_openai_suffixes():
     assert routes._normalize_irodori_base_url("http://127.0.0.1:8088/v1/audio/speech") == "http://127.0.0.1:8088"
     assert routes._normalize_irodori_base_url("http://127.0.0.1:8088/v1") == "http://127.0.0.1:8088"
+
+
+@pytest.mark.parametrize("engine", [None, "", "irodori"])
+def test_irodori_persisted_engine_and_configured_voice(monkeypatch, engine):
+    """The official persisted-engine route must retain the fork engine's defaults."""
+    monkeypatch.setattr(routes, "load_settings", lambda: {"tts_engine": "irodori"})
+    monkeypatch.setattr(routes, "_resolve_irodori_tts_settings", lambda: {
+        "base_url": "http://127.0.0.1:8088", "model": "irodori-tts",
+        "voice": "hakua", "speed": 1.0, "api_key": "",
+    })
+    captured = {}
+
+    class Response(io.BytesIO):
+        headers = {"Content-Type": "audio/mpeg"}
+
+    def open_audio(req, **kwargs):
+        captured.update(json.loads(req.data))
+        return Response(b"ID3test")
+
+    monkeypatch.setattr(routes, "_tts_open", open_audio)
+    body = {"text": "hello", "voice": "none"} if engine != "irodori" else {"text": "hello"}
+    if engine is not None:
+        body["engine"] = engine
+    handler = _post(body)
+    routes._handle_tts(handler, None)
+
+    assert handler.status == 200
+    assert captured["voice"] == ("hakua" if engine == "irodori" else "none")
+    assert handler.wfile.getvalue() == b"ID3test"
+
+
+def test_irodori_profile_mismatch_does_not_read_config(monkeypatch):
+    import api.profiles as profiles
+
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "beta")
+    monkeypatch.setattr(profiles, "_profiles_match", lambda left, right: left == right)
+
+    def unexpected_config():
+        pytest.fail("a stale playback must not read another profile's TTS config")
+
+    monkeypatch.setattr(routes, "_resolve_irodori_tts_settings", unexpected_config)
+    handler = _post({"text": "hello", "engine": "irodori", "profile": "alpha"})
+    routes._handle_tts(handler, None)
+    assert handler.status == 409
+    assert not hasattr(routes._handle_tts, "_tts_limiter")
+
+
+def test_irodori_uses_official_no_redirect_transport(monkeypatch):
+    """Exercise the shared urllib guard against a disposable loopback responder."""
+    requests = []
+
+    class RedirectHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            requests.append((self.command, self.path))
+            self.send_response(302)
+            self.send_header("Location", "/redirected")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_GET(self):
+            requests.append((self.command, self.path))
+            self.send_response(200)
+            self.send_header("Content-Length", "8")
+            self.end_headers()
+            self.wfile.write(b"ID3audio")
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), RedirectHandler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    monkeypatch.setattr(routes, "_resolve_irodori_tts_settings", lambda: {
+        "base_url": f"http://127.0.0.1:{server.server_port}", "model": "irodori-tts",
+        "voice": "hakua", "speed": 1.0, "api_key": "fixture-only-key",
+    })
+    try:
+        handler = _post({"text": "hello", "engine": "irodori"})
+        routes._handle_tts(handler, None)
+        assert handler.status == 502
+        assert requests == [("POST", "/v1/audio/speech")]
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=5)

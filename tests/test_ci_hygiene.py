@@ -137,7 +137,7 @@ def test_local_test_runner_accepts_windows_layout_venv_from_base_python(tmp_path
     env["WSLENV"] = "HERMES_WEBUI_TEST_PYTHON:FAKE_VENV_PY_SOURCE:PYTEST_PROOF_FILE/p"
 
     result = subprocess.run(
-        ["bash", "scripts/test.sh", "tests/example_test.py", "-v", "--timeout=60"],
+        [shutil.which("bash") or "bash", "scripts/test.sh", "tests/example_test.py", "-v", "--timeout=60"],
         cwd=repo,
         env=env,
         text=True,
@@ -194,7 +194,7 @@ def test_local_test_runner_rejects_venv_without_accepted_python_path(tmp_path):
     env["WSLENV"] = "HERMES_WEBUI_TEST_PYTHON:PYTEST_PROOF_FILE/p"
 
     result = subprocess.run(
-        ["bash", "scripts/test.sh", "tests/example_test.py", "-v", "--timeout=60"],
+        [shutil.which("bash") or "bash", "scripts/test.sh", "tests/example_test.py", "-v", "--timeout=60"],
         cwd=repo,
         env=env,
         text=True,

@@ -80,6 +80,8 @@ def test_registration_behavior():
           id: 'edge', label: 'x', synthesize: () => new ArrayBuffer(1) }) === false);
         results.openaiReservedRejected = (window.registerHermesTtsEngine({
           id: 'openai', label: 'x', synthesize: () => new ArrayBuffer(1) }) === false);
+        results.irodoriReservedRejected = (window.registerHermesTtsEngine({
+          id: 'irodori', label: 'x', synthesize: () => new ArrayBuffer(1) }) === false);
         // bad id rejected
         results.badIdRejected = (window.registerHermesTtsEngine({
           id: 'Bad Id!', label: 'x', synthesize: () => new ArrayBuffer(1) }) === false);
@@ -107,6 +109,7 @@ def test_registration_behavior():
     assert r["isRegistered"] is True
     assert r["reservedRejected"] is True
     assert r["openaiReservedRejected"] is True
+    assert r["irodoriReservedRejected"] is True
     assert r["badIdRejected"] is True
     assert r["noSynthRejected"] is True
     assert r["optionListed"] is True
